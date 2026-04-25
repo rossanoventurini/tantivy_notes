@@ -1,0 +1,811 @@
+# Tantivy Implementation Tutorial — Part 2
+
+A precise, source-grounded guide to tantivy's internals. Every claim here is backed by
+actual source code locations so you can read and verify them yourself. Questions and
+exercises follow each concept.
+
+---
+
+## 1. The Segment — Unit of Immutability
+
+Every tantivy index is a collection of **segments**. A segment is:
+
+- **Immutable** once written. Nothing inside a segment is ever modified in place.
+- **Identified** by a UUID, which becomes the prefix of every file that segment produces.
+- **Self-contained**: a segment carries its own term dictionary, posting lists, fast fields,
+  docstore, and field norms. It can be searched independently.
+
+When you call `IndexWriter::commit()`, the writer flushes its in-memory buffer into one new
+segment per active indexing thread, then atomically rewrites `meta.json` to list the new
+segments. Readers pick up the change on their next reload.
+
+Segment merging — combining several small segments into one larger segment — happens in
+background threads and produces new immutable segments; the old ones are deleted once no
+reader holds a reference to them.
+
+### Segment files on disk
+
+Each segment contributes up to 7 files. The extension encodes the data structure stored:
+
+| Extension | Component | Contains |
+|-----------|-----------|---------|
+| `.term` | Term dictionary | `Term → TermInfo` mapping. Two-stage structure: FST for Term→TermOrdinal, then SSTable for TermOrdinal→TermInfo. |
+| `.idx` | Posting lists | Sorted DocId lists per term, with term frequencies. Delta-encoded, bitpacked in blocks of 128. |
+| `.pos` | Positions | Token positions within each document per term. Required for phrase queries. |
+| `.fast` | Fast fields | Column-oriented numeric/bool/date/IP storage. Bitpacked. O(1) random access. |
+| `.fieldnorm` | Field norms | One byte per document per indexed text field. Encodes field length for BM25. |
+| `.store` | Docstore | Compressed, block-oriented row store of all STORED field values (LZ4 or Zstd). |
+| `.<opstamp>.del` | Alive bitset | Bitset of alive (non-deleted) DocIds. Rewritten on each commit that changes deletions. The opstamp in the filename allows multiple versions to coexist briefly. |
+
+Source: `src/index/segment_component.rs`, `src/index/index_meta.rs:111–120`.
+
+```
+<segment_uuid>.term
+<segment_uuid>.idx
+<segment_uuid>.pos
+<segment_uuid>.fast
+<segment_uuid>.fieldnorm
+<segment_uuid>.store
+<segment_uuid>.<opstamp>.del
+```
+
+### meta.json
+
+`meta.json` is the ground truth for which segments exist. It is written atomically (write
+to a temp file, then rename) to guarantee consistency. Its structure:
+
+```json
+{
+  "segments": [
+    {
+      "segment_id": "abc123...",
+      "max_doc": 847291,
+      "deletes": { "num_deleted_docs": 12, "opstamp": 7 }
+    }
+  ],
+  "schema": [ ... ],
+  "opstamp": 42,
+  "payload": null
+}
+```
+
+`opstamp` is a monotonically increasing operation counter. Every `add_document` and `commit`
+increments it. It is used to version deletion bitsets and to detect stale readers.
+
+Source: `src/index/index_meta.rs`.
+
+### Questions
+
+1. You add 1 000 documents in one thread and commit. How many segment files does tantivy
+   write at minimum? Name the extensions.
+2. What is `meta.json` used for? Why is it written atomically?
+3. You create a writer with `writer_with_num_threads(4, 50_000_000)`. You commit. How many
+   new segments can be created in that commit?
+4. A segment has `max_doc = 10 000` and `num_deleted_docs = 3 000`. What fraction of the
+   segment's bytes is wasted? When will those bytes be reclaimed?
+
+### Exercise I-1 — Inspect a real index
+
+Create a small index with the amazon_indexer or any tantivy program. After committing, run:
+
+```bash
+ls -lh <index_dir>/
+cat <index_dir>/meta.json | python3 -m json.tool
+```
+
+Identify each file, match it to the table above. Note the size relationships: which file is
+largest? Does the ratio match your expectations given the data?
+
+---
+
+## 2. DocId — The Local Identifier
+
+Within a segment, every document is assigned a `DocId: u32` in the range `[0, max_doc)`.
+DocIds are allocated sequentially in the order documents are added.
+
+This compact, dense space is the key to the compression strategies that make tantivy fast:
+
+- **Posting lists** store *deltas* between consecutive DocIds. Small deltas → few bits per
+  entry → excellent bitpacking compression.
+- **Fast fields** use DocId as a direct array index: `value = array[doc_id]`.
+- **The alive bitset** is literally a bitset of size `max_doc`, one bit per DocId.
+
+`DocId` is segment-local. The same document's DocId in segment A is completely unrelated to
+a DocId in segment B. The `DocAddress` struct (which searchers return) pairs a `DocId` with
+a `segment_ord` to disambiguate.
+
+### Questions
+
+1. Why are DocIds allocated sequentially and why does this matter for compression?
+2. A segment has `max_doc = 5000` and the alive bitset shows 4800 live docs. How large is the
+   bitset in bytes?
+3. You search across 3 segments. The top result is `DocAddress { segment_ord: 1, doc_id: 42 }`.
+   What does segment_ord 1 mean?
+
+---
+
+## 3. The Inverted Index — Term to DocIds
+
+The inverted index is the core data structure enabling full-text search. It maps each term
+to the list of documents containing that term.
+
+```
+Term ──► TermOrdinal ──► TermInfo ──► posting list (DocIds + term freqs)
+         (via FST)        (via SSTable)  (in .idx file)
+                                     └► positions (in .pos file)
+```
+
+This two-stage lookup is split across two files:
+- `.term` — the term dictionary (FST + SSTable)
+- `.idx` — the raw posting list bytes
+
+### 3.1 Term encoding
+
+A `Term` is a sequence of bytes with a type prefix. The byte representation is designed to
+preserve the natural ordering of the underlying type so that range queries become byte-range
+lookups.
+
+| Field type | Encoding |
+|-----------|----------|
+| `text` | UTF-8 bytes |
+| `u64` | 8-byte big-endian |
+| `i64` | 8-byte big-endian, sign bit flipped (so negatives come before positives) |
+| `f64` | 8-byte big-endian, sign and exponent bits adjusted for signed ordering |
+| `bool` | 1 byte: 0 or 1 |
+| `date` | Same as i64 (microseconds since epoch) |
+
+The big-endian encoding means that for two values `a < b`, the byte representation of `a` is
+lexicographically less than the byte representation of `b`. A numeric range `[lo, hi]` is
+therefore equivalent to a byte-range `[encode(lo), encode(hi)]` in the term dictionary.
+
+Source: `src/schema/term.rs:275–292`.
+
+### 3.2 The term dictionary (.term)
+
+The term dictionary is itself a two-layer structure:
+
+**Layer 1 — FST (Finite State Transducer)**
+
+The FST maps each term's byte representation to a `TermOrdinal` (a `u64` ordinal, starting
+at 0). The FST is extremely compact — it compresses common prefixes across all terms and is
+stored as a single memory-mapped blob. A lookup is O(key length) and requires no heap
+allocation.
+
+**Layer 2 — SSTable (TermInfoStore)**
+
+The SSTable maps `TermOrdinal → TermInfo`. `TermInfo` contains:
+
+```rust
+pub struct TermInfo {
+    pub doc_freq: u32,        // how many documents contain this term
+    pub postings_range: Range<usize>,  // byte offset range in the .idx file
+    pub positions_range: Range<usize>, // byte offset range in the .pos file
+}
+```
+
+Source: `src/postings/term_info.rs`.
+
+Together: to look up a term, the FST converts the term bytes to an ordinal in O(|term|), and
+the SSTable converts that ordinal to a `TermInfo` in O(1). The `postings_range` is then used
+to slice the `.idx` mmap directly.
+
+Source: `src/termdict/mod.rs`, `sstable/`.
+
+### Questions
+
+1. Why is `u64` stored big-endian rather than little-endian in the term dictionary?
+2. You search for `price >= 10.0 AND price <= 50.0`. Describe exactly what tantivy looks up
+   in the term dictionary for this range query.
+3. A term has `doc_freq = 0`. Is it possible? What would `postings_range` be?
+4. The FST maps Term → TermOrdinal. Why is this ordinal needed? Why not map directly to
+   TermInfo?
+
+### Exercise I-2 — Manual term lookup
+
+Write a small Rust program that opens an existing index, acquires a `SegmentReader`, and uses
+`inverted_index(field)?` to get the `InvertedIndexReader`. Call `get_term_info(&term)` for
+several terms and print the `doc_freq` and byte ranges. Verify that more common terms
+(stop words) have higher `doc_freq`.
+
+---
+
+## 4. Posting Lists (.idx) — DocId Lists per Term
+
+A posting list is the list of DocIds of all documents containing a given term, stored sorted
+in ascending order. It also stores term frequencies (how many times the term appears per doc).
+
+### 4.1 Block structure
+
+Posting lists are stored in **blocks of 128 DocIds** (`COMPRESSION_BLOCK_SIZE = BitPacker4x::BLOCK_LEN = 128`).
+
+Each full block is:
+1. **Delta-encoded**: instead of storing absolute DocIds `[5, 17, 30, ...]`, the list stores
+   the *differences* `[5, 12, 13, ...]`. Since DocIds are sorted, deltas are always positive
+   and typically small — a document every N positions has delta ≈ N.
+2. **Bitpacked**: the deltas are all packed at the minimum number of bits needed to represent
+   the largest delta in the block. If the largest delta is 127, only 7 bits per value are
+   needed — storing 128 DocIds takes just 128 bytes instead of 512 bytes for 32-bit integers.
+
+The `BitPacker4x` crate uses SSE2 SIMD instructions to compress and decompress 4 DocIds
+simultaneously, making block decompression extremely fast.
+
+A **skip list** accompanies the posting list, storing the last DocId in each block and the
+byte offset of that block. This allows jumping to the first block that *might* contain a
+target DocId without decompressing earlier blocks — critical for `AND` queries where two
+posting lists must be intersected.
+
+For **incomplete last blocks** (fewer than 128 docs), variable-length integer (vint) encoding
+is used instead. Vint stores each u32 in 1–5 bytes depending on its magnitude.
+
+Source: `src/postings/compression/mod.rs`, `src/postings/skip.rs`.
+
+### 4.2 Term frequencies
+
+Each block of 128 DocIds is followed by a block of 128 term frequencies. These are also
+bitpacked (not delta-encoded, since frequencies are not monotone).
+
+If the field is indexed with `IndexRecordOption::Basic` (no frequencies), term frequencies
+are not written.
+
+### 4.3 DocSet trait and lazy iteration
+
+When executing a query, tantivy does not load the entire posting list into memory. Instead it
+exposes a lazy `DocSet` iterator that decompresses one block at a time as you advance through
+it. The decompressed block is a stack-allocated `[u32; 128]` array.
+
+Two posting list iterators can be intersected (`AND`) efficiently because both are sorted:
+this is essentially a merge of two sorted sequences, with the skip list used to skip large
+gaps quickly.
+
+Source: `src/postings/`, `src/docset.rs`.
+
+### Questions
+
+1. A posting list has 300 DocIds. How many full bitpacked blocks does it have? How are the
+   remaining entries encoded?
+2. Why are DocIds delta-encoded before bitpacking? What would happen to compression if they
+   were stored as absolute values?
+3. Two posting lists for terms "war" (5000 docs) and "peace" (3000 docs) are intersected for
+   an AND query. Describe how the skip list helps avoid decompressing unnecessary blocks.
+4. `IndexRecordOption::Basic` vs `WithFreqs` vs `WithFreqsAndPositions` — what data is stored
+   for each option? When is each appropriate?
+
+### Exercise I-3 — Block counting
+
+Index a large text corpus (e.g. the Amazon reviews dataset). For a common term like "good",
+retrieve its `TermInfo`. Compute: how many full 128-doc blocks does its posting list require?
+How many bytes does the posting list occupy? What is the bytes-per-DocId ratio?
+
+---
+
+## 5. Token Positions (.pos) — Enabling Phrase Queries
+
+For fields indexed with `TEXT` (which stores positions), the tokeniser records where each
+token appears within the document: token 0, 1, 2, ...
+
+Positions are stored in a separate `.pos` file, pointed to by `TermInfo.positions_range`.
+Within each document, positions are **delta-encoded** — store the difference between
+consecutive positions, not the absolute position.
+
+Example: tokens at positions `[2, 5, 9]` → stored as `[2, 3, 4]`.
+
+When executing a phrase query for `["quick", "brown", "fox"]`, tantivy:
+1. Fetches the posting list for each term (DocIds where each term appears).
+2. Intersects the three posting lists to find documents containing all three terms.
+3. For each candidate document, reads the positions of each term and checks whether
+   there exists a consecutive sequence with gaps of exactly 1.
+
+Source: `src/positions/`, `src/query/phrase_query/`.
+
+### Questions
+
+1. A document has the sentence "The fox ate the fox". How are the positions of "fox" stored
+   in the position list?
+2. A field is indexed with `STRING`. Can you run a phrase query on it? Why?
+3. The phrase query `"quick brown fox"` does not match "quick and brown fox" (there is an
+   extra word). How does the position comparison detect this mismatch?
+
+---
+
+## 6. Fast Fields (.fast) — Column Store
+
+Fast fields provide O(1) random access to a single field value for any DocId. They are used
+for sorting results, aggregations, and reading values during scoring.
+
+### 6.1 Physical layout
+
+For a numeric fast field (e.g. `u64`), the data is stored as a column:
+
+```
+min_value: u64          (stored in the file header)
+num_bits:  u8           (bits needed to represent max_value - min_value)
+
+packed data: [(value[0] - min_value), (value[1] - min_value), ...]
+             all packed at `num_bits` bits each
+```
+
+Fetching value for `DocId d`:
+
+```
+bit_offset = num_bits * d
+byte_offset = bit_offset / 8
+value = min_value + fetch_bits(data[byte_offset..], bit_offset % 8, num_bits)
+```
+
+This requires a single memory access (often a cache hit, since access patterns during search
+tend to be sequential). The `columnar` crate implements this logic.
+
+Source: `src/fastfield/`, `columnar/`.
+
+### 6.2 Multi-valued fast fields
+
+A fast field can have multiple values per document (e.g. a document with several tags). In
+this case the column stores an additional index array giving the start offset of each
+document's values.
+
+### 6.3 The alive bitset
+
+The `.del` file stores a `BitSet` (one bit per DocId) marking which documents are alive (not
+deleted). Deleted documents are simply those whose bit is 0. All collectors automatically
+skip DocIds with a 0 alive bit.
+
+### Questions
+
+1. A `u64` fast field has `min_value = 1000` and `max_value = 65535`. How many bits per doc
+   are needed? For 1 million documents, how large is the fast field file in bytes (ignoring
+   header)?
+2. Why is column-oriented storage faster than row-oriented storage (the docstore) for
+   aggregations?
+3. The alive bitset is consulted for every matched DocId. Why is this not expensive?
+
+### Exercise I-4 — Fast field access
+
+Write a program that opens an index segment and uses:
+
+```rust
+let reader = searcher.segment_reader(segment_ord);
+let ff_reader = reader.fast_fields();
+let rating: Column<f64> = ff_reader.f64("rating")?;
+println!("DocId 0 rating: {:?}", rating.first(0));
+```
+
+Iterate over 10 DocIds and compare the values to those in the docstore. Verify they match.
+
+---
+
+## 7. Field Norms (.fieldnorm) — BM25 Length Normalisation
+
+The BM25 formula needs `dl` — the number of tokens in a given field for a given document.
+Tantivy stores this as one byte per (document, field) pair in the `.fieldnorm` file.
+
+Since one byte can only encode 256 distinct values but documents can have any number of
+tokens, the encoding uses a **non-linear lookup table** with 256 entries. The first 41
+entries (IDs 0–40) are the exact values 0–40. For larger lengths the table uses an
+exponentially growing scale, so large documents with similar lengths map to the same ID.
+
+```
+fieldnorm_id 0  →  length 0
+fieldnorm_id 1  →  length 1
+...
+fieldnorm_id 40 →  length 40
+fieldnorm_id 41 →  length 42
+fieldnorm_id 42 →  length 44
+...
+fieldnorm_id 255 → length 2_013_265_944
+```
+
+Source: `src/fieldnorm/code.rs` — the full `FIELD_NORMS_TABLE` is defined there (256 values).
+
+This quantisation introduces a small scoring imprecision for long documents, but the table
+is designed so that the error never exceeds about 6% per step at the exponential part.
+
+The BM25 scorer pre-computes `cached_tf_component(fieldnorm, avg_fieldnorm)` for all 256
+possible fieldnorm IDs at query construction time, so during scoring it does a single array
+lookup instead of a division.
+
+Source: `src/query/bm25.rs:58–66`.
+
+### Questions
+
+1. A document's `title` field has 41 tokens. What fieldnorm ID is stored? What about 42
+   tokens?
+2. Why does the fieldnorm table use a non-linear (exponential) scale rather than a linear one?
+3. If two documents have 100 000 and 110 000 tokens respectively, will BM25 treat them
+   differently or almost the same? Why?
+
+---
+
+## 8. The Docstore (.store) — Retrieving Stored Fields
+
+The docstore provides key-value retrieval: given a DocId, return all STORED field values for
+that document.
+
+### 8.1 Block structure
+
+Documents are accumulated in an in-memory buffer. When the buffer exceeds **16 KB** (`BLOCK_SIZE = 16_384`), it is compressed (LZ4 by default, Zstd optionally) and flushed as one
+block. A skip index maps DocIds to the byte offset of the block containing them, so that
+fetching a document requires at most one block decompression.
+
+The reader caches the last **100 recently decompressed blocks** (`DOCSTORE_CACHE_CAPACITY = 100`), so accessing documents within the same block after the first fetch is essentially free.
+
+Source: `src/store/mod.rs:76`, `src/store/reader.rs:25`.
+
+### 8.2 Why the docstore is slow for per-doc access during scoring
+
+Fetching one document requires:
+1. Look up the skip index to find the block byte offset — O(log segments).
+2. Seek in the mmap to that offset.
+3. Decompress the entire block (up to 16 KB, even if only 1 doc is needed).
+4. Deserialise the document.
+
+This is fine for 10 results on a SERP. For 100 000 matched documents it is catastrophic.
+
+### Questions
+
+1. You have 1000 documents, each with a `body` field averaging 2 KB. Estimate the number of
+   16 KB blocks. How many decompression operations does fetching 10 random documents require?
+2. The cache holds 100 blocks. In a search that decompresses 100 unique blocks and then
+   repeats the same 10 documents, how many decompression calls happen in total?
+3. You want to retrieve a `rating: f64` field for the top 10 000 matched documents during
+   aggregation. Should you use the docstore or a fast field? Why?
+
+---
+
+## 9. BM25 Scoring — Full Details
+
+Source: `src/query/bm25.rs`. Constants: `K1 = 1.2`, `B = 0.75`.
+
+### 9.1 IDF
+
+```rust
+pub(crate) fn idf(doc_freq: u64, doc_count: u64) -> Score {
+    let x = ((doc_count - doc_freq) as f32 + 0.5) / (doc_freq as f32 + 0.5);
+    (1.0 + x).ln()
+}
+```
+
+- `doc_count` = total documents in the index (across all segments, including deleted ones).
+- `doc_freq` = number of documents containing the term.
+- The `+0.5` in numerator and denominator is a smoothing constant that avoids division by
+  zero and reduces the influence of very rare terms slightly.
+
+IDF is computed **once per term per search**, not per document. It is multiplied by
+`(1 + K1)` to form the `weight` stored in `Bm25Weight`.
+
+### 9.2 TF normalisation (pre-computed cache)
+
+```rust
+fn cached_tf_component(fieldnorm: u32, average_fieldnorm: Score) -> Score {
+    K1 * (1.0 - B + B * fieldnorm as f32 / average_fieldnorm)
+}
+```
+
+This is computed for all 256 fieldnorm IDs at query construction time and stored in a
+`[Score; 256]` array (`Bm25Weight.cache`). During scoring, the denominator part is a single
+array lookup.
+
+The final per-document score for one term:
+
+```
+score(d, t) = weight × (tf / (tf + cache[fieldnorm_id[d]]))
+
+where weight = IDF(t) × (1 + K1)
+```
+
+### 9.3 Multi-term queries
+
+For a `BooleanQuery` with multiple `Must` or `Should` terms, the scores from individual
+`TermQuery` scorers are **summed**. There is no normalisation by number of terms.
+
+### 9.4 Scoring statistics come from the Searcher, not one segment
+
+IDF requires knowing the global document count and the global term document frequency across
+all segments. The `Searcher` collects these statistics by iterating over all its
+`SegmentReader`s before constructing the `Bm25Weight`. Each segment scores independently
+using the global statistics.
+
+Source: `src/query/bm25.rs:95–145`.
+
+### Questions
+
+1. Term "the" has `doc_freq ≈ doc_count`. Compute the IDF. What score does a document
+   matching "the" receive from the IDF component?
+2. Term "fulvous" appears in 2 documents out of 1 000 000. Compute the IDF.
+3. A document with `title_fieldnorm_id = 5` (5 tokens) matches a term with `tf = 1`. Using
+   `K1 = 1.2`, `B = 0.75`, and `average_fieldnorm = 10`, compute the TF factor.
+4. You run `explain()` and see that the IDF contribution is 0.0001. What does this tell you
+   about the query term?
+
+### Exercise I-5 — Reproduce BM25 by hand
+
+1. Index 5 documents with varying body lengths and a shared term (e.g. "ocean").
+2. Search for "ocean".
+3. For the top result, call `explain()` and copy the values for `N`, `n`, `freq`, `dl`,
+   `avgdl`.
+4. Manually compute the score using the formulas above and verify it matches.
+
+---
+
+## 10. The Indexing Pipeline — From add_document() to Disk
+
+### 10.1 The Stacker (in-memory buffer)
+
+When you call `IndexWriter::add_document()`, the document is sent to one of the indexing
+threads via a channel. Each thread owns a `Stacker` — a hash map from `Term` to
+`(Vec<DocId>, Vec<TermFreq>, Vec<PositionDelta>)`.
+
+The Stacker accumulates documents until either:
+- The memory budget is exhausted (based on the `heap_size` passed to `writer()`), or
+- `commit()` is called.
+
+At that point the Stacker is serialised to disk as a segment.
+
+Source: `stacker/`, `src/indexer/segment_writer.rs`.
+
+### 10.2 Serialisation to segment files
+
+Serialisation happens in term-sorted order:
+
+1. **Sort terms** — iterate the Stacker's hash map in sorted order (required for FST construction).
+2. **Build FST** — feed terms in order to an FST builder; each term is mapped to its ordinal.
+3. **Write posting list** — for each term, compress and write its DocId list (delta + bitpack) to `.idx`.
+4. **Write positions** — for fields with positions, delta-encode and write to `.pos`.
+5. **Write term info** — write `TermInfo` (doc_freq, byte ranges) to the SSTable in `.term`.
+6. **Write fast fields** — flush column-oriented numeric data to `.fast`.
+7. **Write field norms** — write one byte per (doc, field) to `.fieldnorm`.
+8. **Write docstore** — write compressed blocks of stored fields to `.store`.
+9. **Update meta.json** — atomically record the new segment in `meta.json`.
+
+Source: `src/indexer/segment_writer.rs`, `src/postings/serializer.rs`.
+
+### 10.3 Multithreaded indexing
+
+The `IndexWriter` spawns N threads (one per CPU core by default). Documents are distributed
+round-robin across threads. Each thread independently manages its own Stacker and produces
+its own segment on commit. This is why committing with N threads can produce N new segments.
+
+### Questions
+
+1. Why must terms be processed in sorted order during serialisation? What data structure
+   requires this?
+2. You call `IndexWriter::commit()` without ever calling `add_document()`. How many new
+   segments are created?
+3. Documents are distributed across threads. If thread 1 indexes documents 1, 3, 5 and
+   thread 2 indexes documents 2, 4, 6 — are the DocIds in each segment contiguous or
+   interleaved?
+
+---
+
+## 11. Segment Merges — Background Housekeeping
+
+### 11.1 Why merges happen
+
+After many commits, the index has many small segments. Too many segments hurt search
+performance (every query must be evaluated on each segment independently). Merging:
+- Reduces the segment count.
+- Permanently removes tombstoned (deleted) documents.
+
+### 11.2 LogMergePolicy (the default)
+
+Tantivy groups segments into **logarithmic layers** by document count. Segments in the same
+layer are candidates for merging. Key defaults:
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `min_num_segments` | 8 | Minimum number of segments to merge at once |
+| `min_layer_size` | 10 000 | All segments smaller than this are in the same layer |
+| `max_docs_before_merge` | 10 000 000 | Segments larger than this are never merged |
+| `level_log_size` | 0.75 | Layer boundaries grow exponentially with this factor |
+
+Source: `src/indexer/log_merge_policy.rs`.
+
+### 11.3 Merge execution
+
+A merge runs in a background thread. It:
+1. Opens segment readers for all source segments.
+2. Creates a new segment writer.
+3. Iterates all source DocIds in order, skipping deleted ones.
+4. Writes all data structures (posting lists, fast fields, docstore, etc.) for the merged
+   segment.
+5. Atomically updates `meta.json` to replace the source segments with the merged segment.
+6. Old segment files are deleted once no reader holds a reference.
+
+The merge produces a new immutable segment; it never modifies the source segments. Readers
+that started before the merge completed continue to use the old segments safely.
+
+### Questions
+
+1. You commit 20 times in quick succession with the default policy. When does the first
+   merge happen?
+2. A merged segment has no `.del` file. Why? (Think about what merging does to deleted docs.)
+3. A reader is holding a snapshot that includes old segment A. A merge completes and deletes
+   segment A's files. Does the reader crash? Why?
+
+---
+
+## 12. Range Queries on Numeric Fields — Two Strategies
+
+### 12.1 Strategy 1: Inverted index scan (default)
+
+Because numeric values are encoded as big-endian bytes (preserving ordering), a numeric
+range `[lo, hi]` becomes a byte-range `[encode(lo), encode(hi)]` in the term dictionary.
+
+The `InvertedIndexRangeQuery`:
+1. Asks the term dictionary for a **range stream** — an iterator over all terms whose byte
+   representation falls in the given range.
+2. For each matching term, loads its posting list and adds all DocIds to a `BitSet`.
+3. Returns the fully materialised BitSet as a DocSet.
+
+This strategy pre-materialises all matching DocIds upfront. It is efficient when the range
+matches few terms (e.g. exact value lookup) but expensive when the range is very wide (e.g.
+all prices in [0, 10^6]).
+
+Source: `src/query/range_query/range_query.rs:16–30`, `src/query/range_query/range_query.rs:128–213`.
+
+### 12.2 Strategy 2: Fast field scan (lazy)
+
+For IP address fields (and extensible to others), tantivy uses a second strategy: scan the
+fast field column directly.
+
+The `FastFieldRangeDocSet`:
+1. Opens the fast field column reader.
+2. Iterates DocIds from 0 to max_doc sequentially.
+3. For each DocId, fetches its value and checks whether it falls in the range.
+4. Emits matching DocIds lazily (one at a time without materialising a BitSet).
+
+This is lazy and memory-efficient. It is favoured when the fast field fits in cache or when
+the range is wide (many matching documents), because the column-oriented access pattern is
+cache-friendly.
+
+Source: `src/query/range_query/fast_field_range_doc_set.rs`,
+`src/query/range_query/range_query_fastfield.rs`.
+
+### 12.3 Choosing between strategies
+
+`RangeQuery::new()` inspects the field type. If the field is an IP address field, it uses
+Strategy 2. Otherwise it uses Strategy 1 (inverted index scan). In practice, for numeric
+fields that have both `INDEXED` and `FAST`, you can also manually construct a
+`FastFieldRangeDocSet` to get the lazy strategy.
+
+### Questions
+
+1. You run a range query `price BETWEEN 0 AND 1000000` on a field with 10 000 distinct price
+   values. Which strategy does the inverted index scan use? How many posting list lookups
+   occur?
+2. The fast field scan iterates all DocIds from 0 to max_doc. For a segment with 5 million
+   documents, is this slow? Why or why not?
+3. What property of the byte encoding makes it possible to turn a numeric range into a
+   byte-range scan of the term dictionary?
+
+### Exercise I-6 — Range query performance
+
+Using the Amazon reviews index:
+1. Create a range query on `rating` for `[4.0, 5.0]` and on `timestamp_ms` for a 1-year
+   window.
+2. Use `Count` to count the matching documents.
+3. Use `std::time::Instant` to measure how long each query takes.
+4. Try adding `FAST` to a field that only had `INDEXED` and re-run. Does it change the speed?
+
+---
+
+## 13. Query Execution — Query → Weight → Scorer
+
+Understanding this chain is essential for implementing custom queries.
+
+```
+Query
+  └─ create_weight(&searcher, scoring_enabled) → Weight
+        └─ (per segment) scorer(segment_reader) → Scorer
+                └─ advance() → DocId
+                   score() → f32
+```
+
+### 13.1 Query
+
+A `Query` is a stateless, shareable description of what to match. It knows nothing about
+segments. Its only job is to produce a `Weight`.
+
+```rust
+pub trait Query: Debug + Any {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> Result<Box<dyn Weight>>;
+    fn explain(&self, searcher: &Searcher, doc: DocAddress) -> Result<Explanation>;
+    fn count(&self, searcher: &Searcher) -> Result<usize>;
+}
+```
+
+### 13.2 Weight
+
+A `Weight` is created once per search. It has access to the `Searcher` and can pre-compute
+index-wide statistics (like IDF). It produces a `Scorer` for each segment.
+
+```rust
+pub trait Weight: Send + Sync {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>>;
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation>;
+}
+```
+
+### 13.3 Scorer
+
+A `Scorer` is a `DocSet` — a lazy iterator over matched DocIds in the current segment.
+It also provides a `score()` method.
+
+```rust
+pub trait Scorer: DocSet {
+    fn score(&mut self) -> Score;
+}
+
+pub trait DocSet {
+    fn advance(&mut self) -> DocId;   // moves to next matching doc
+    fn doc(&self) -> DocId;            // current DocId
+    fn size_hint(&self) -> u32;
+}
+```
+
+The `Searcher::search` method iterates over all segment readers, calls `weight.scorer(reader)` for each, then calls `advance()` repeatedly and passes each DocId to the Collector.
+
+Source: `src/query/query.rs`, `src/query/weight.rs`, `src/query/scorer.rs`.
+
+### Questions
+
+1. At which level (Query, Weight, or Scorer) is the IDF computed? Why there?
+2. A `BooleanQuery` with `[Must A, Must B]` creates a scorer that intersects two DocSets.
+   Describe how the intersection is computed efficiently given that both are sorted.
+3. A custom `Scorer` that always returns `score() = 1.0` — what query type would this
+   correspond to semantically?
+
+---
+
+## 14. Capstone — Full Query Trace
+
+Trace a call to `searcher.search(&query, &TopDocs::with_limit(10))` step by step:
+
+1. `Searcher::search` calls `query.weight(EnableScoring::Enabled)` → `BooleanWeight`.
+2. `BooleanWeight::new` queries the `Searcher` for global IDF statistics (total docs,
+   per-term doc_freq across all segments).
+3. For each segment reader in the searcher (there may be many):
+   a. `weight.scorer(segment_reader, 1.0)` → `BooleanScorer`.
+   b. `BooleanScorer` wraps individual `TermScorer`s for each term, each backed by a block
+      postings reader pointing into the `.idx` mmap.
+   c. The collector calls `scorer.advance()` → decompresses next block if needed → returns
+      next DocId.
+   d. If the DocId is alive (checked against the `.del` bitset), `scorer.score()` is called.
+   e. Score is computed: `Bm25Weight.weight × (tf / (tf + cache[fieldnorm_id]))` where
+      `fieldnorm_id` is looked up in the `.fieldnorm` mmap.
+   f. `TopDocs` collector maintains a min-heap of the top-10 (score, DocAddress) pairs.
+4. After all segments, `TopDocs` sorts the heap and returns `Vec<(Score, DocAddress)>`.
+5. You call `searcher.doc(addr)` → slice the `.store` mmap → decompress the block → deserialise the document.
+
+### Exercise I-7 — Capstone trace
+
+Add `println!` calls (or use `log::debug!`) inside:
+- `Bm25Weight::score`
+- `BlockPostings::advance`
+- `StoreReader::get`
+
+Run a query on a small index and observe the call pattern. Answer:
+- How many `advance()` calls are made?
+- How many `score()` calls (only live, matched documents)?
+- How many `StoreReader::get` calls?
+
+---
+
+## Reference: Key Source Locations
+
+| Topic | File |
+|-------|------|
+| Segment file extensions | `src/index/index_meta.rs:111–120` |
+| meta.json structure | `src/index/index_meta.rs` |
+| Term encoding (big-endian) | `src/schema/term.rs` |
+| FST term dictionary | `src/termdict/`, `sstable/` |
+| TermInfo structure | `src/postings/term_info.rs` |
+| Posting block size (128) | `src/postings/compression/mod.rs:3` |
+| BitPacker4x SIMD | `bitpacker/` |
+| Skip list | `src/postings/skip.rs` |
+| Field norm table (256 values) | `src/fieldnorm/code.rs` |
+| BM25 formula (K1=1.2, B=0.75) | `src/query/bm25.rs:8–9, 52–66` |
+| Docstore block size (16 KB) | `src/store/mod.rs:76` |
+| Docstore cache (100 blocks) | `src/store/reader.rs:25` |
+| LogMergePolicy defaults | `src/indexer/log_merge_policy.rs:8–15` |
+| Range query strategies | `src/query/range_query/` |
+| Query/Weight/Scorer traits | `src/query/query.rs`, `weight.rs`, `scorer.rs` |

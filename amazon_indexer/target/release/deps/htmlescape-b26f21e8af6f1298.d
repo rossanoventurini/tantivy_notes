@@ -1,0 +1,11 @@
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/htmlescape-b26f21e8af6f1298.d: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/encode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/decode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/entities.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/io_support.rs
+
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/libhtmlescape-b26f21e8af6f1298.rlib: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/encode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/decode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/entities.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/io_support.rs
+
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/libhtmlescape-b26f21e8af6f1298.rmeta: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/encode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/decode.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/entities.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/io_support.rs
+
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/lib.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/encode.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/decode.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/entities.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/htmlescape-0.3.1/src/io_support.rs:

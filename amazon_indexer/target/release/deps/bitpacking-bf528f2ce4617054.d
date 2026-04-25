@@ -1,0 +1,11 @@
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/bitpacking-bf528f2ce4617054.d: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/libbitpacking-bf528f2ce4617054.rlib: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/rossano/tantivy/my_notes/amazon_indexer/target/release/deps/libbitpacking-bf528f2ce4617054.rmeta: /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs:
+/home/rossano/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs:

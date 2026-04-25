@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "amazon_indexer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "index"
+path = "src/index.rs"
+
+[[bin]]
+name = "search"
+path = "src/search.rs"
+
+[dependencies]
+tantivy = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
