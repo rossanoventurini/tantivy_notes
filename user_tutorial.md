@@ -511,6 +511,58 @@ For each field below, choose the right combination of options and justify:
 - `author_name`: full-text searchable, also displayed in results.
 - `view_count`: used for sorting by popularity and for aggregations; never displayed.
 
+#### Answers
+
+- **`article_id`** → `STRING`. Used only for `delete_term` and dedup, so we need exact
+  match (`STRING`, not `TEXT`: no tokenisation, case-preserving). Not `STORED`
+  because we never display it back, not `FAST` because we never sort or aggregate
+  on it.
+
+- **`content`** → `TEXT`. Full-text searchable means tokenised + positions (so phrase
+  queries work later), which is exactly what `TEXT` gives. Not `STORED` because we
+  never display the verbatim body — saves the docstore the cost of LZ4-blocking the
+  largest field on every document.
+
+- **`published_at`** → `INDEXED | FAST`. We want both date-range filtering (inverted
+  index byte-range scan over the order-preserving `i64` encoding → `INDEXED`) and
+  sort-by-recency (column store → `FAST`). Add `STORED` only if you also want to
+  return the timestamp in results.
+
+- **`author_name`** → `TEXT | STORED`. Full-text searchable on names ("Mary
+  Shelley" matches a query for `"shelley"`) → `TEXT`. Displayed in results →
+  `STORED`. If you also wanted aggregation by exact author, you'd switch to
+  `STRING | FAST | STORED` instead — but the requirement says "full-text", so `TEXT`
+  wins.
+
+  **Can a field be both `STRING` and `TEXT`?** No — they are *mutually exclusive*
+  on a single field. `TEXT` and `STRING` are presets of the same `TextFieldIndexing`
+  options (analyser + `IndexRecordOption`), and a field has exactly one indexing
+  pipeline. `TEXT | STRING` does not compose: the bitwise OR would just clobber one
+  with the other, not give you both.
+
+  The standard workaround when you need *both* tokenised search and exact-value
+  semantics is to **declare the same value as two separate fields** — the
+  "multi-field" pattern from Lucene/Elasticsearch. For example:
+
+  ```rust
+  let author_name      = sb.add_text_field("author_name",     TEXT | STORED);
+  let author_name_exact = sb.add_text_field("author_name_exact", STRING | FAST);
+  // ...
+  doc.add_text(author_name,       "Mary Shelley");
+  doc.add_text(author_name_exact, "Mary Shelley");
+  ```
+
+  Now `author_name` powers full-text search ("shelley" matches), while
+  `author_name_exact` powers exact filters and `terms` aggregations on the
+  un-tokenised value `"Mary Shelley"`. The cost is two posting-list paths and a
+  duplicated value at indexing time — usually a fine trade for the flexibility.
+
+- **`view_count`** → `FAST`. Sorting and aggregation only need the column store;
+  no `INDEXED` is required (we never run a `TermQuery` on view counts), and no
+  `STORED` because the field is never displayed. This is the cheapest option:
+  one fixed-width column entry per `DocId`, no dictionary entries, no docstore
+  bytes.
+
 ---
 
 ### 3.1.1 Multi-valued STRING fields (tags)
@@ -550,10 +602,157 @@ TermQuery::new(
   matches any document that added `"rust"` to `tags`, regardless of the other tags it
   carries.
 - **Aggregations / facets / sort.** Add `FAST` (`STRING | FAST`) so each tag value can
-  be read as a column entry per `DocId`. Without `FAST` you can search but not bucket.
+  be read as a column entry per `DocId`. Without `FAST` you can search but not bucket
+  (see below).
+
+#### Search vs. bucket — two opposite directions
+
+"Search" and "bucket" use the same field but walk it in opposite directions, and tantivy
+stores those directions in **different files**.
+
+| Pattern | Direction | Data structure | Flag |
+|---------|-----------|---------------|------|
+| **Search** | value → DocIds ("which docs contain `rust`?") | inverted index (term dict + posting list) | `STRING` (or `TEXT`) |
+| **Bucket** | DocId → value ("what tag does *this* doc carry?") | column store, indexed by `DocId` | `FAST` |
+
+A `terms` aggregation, a `FacetCollector`, sorting by a field, or a `tweak_score`
+closure that reads the field value all walk the matched documents and ask "what is
+this field's value for this `DocId`?" — once per doc. That direction is exactly what
+`FAST` builds.
+
+Concrete example. Declare `tags` as `STRING` only:
+
+```rust
+let tags = sb.add_text_field("tags", STRING);   // no FAST
+```
+
+Searching works — the inverted index has a posting list for each tag value:
+
+```rust
+let q = TermQuery::new(
+    Term::from_field_text(tags, "rust"),
+    IndexRecordOption::Basic,
+);
+let hits = searcher.search(&q, &TopDocs::with_limit(10))?;
+// returns docs that contain the tag "rust"
+```
+
+Bucketing fails — there is no column to read per `DocId`:
+
+```rust
+use tantivy::aggregation::{AggContextParams, AggregationCollector, agg_req::Aggregations};
+
+let agg: Aggregations = serde_json::from_value(json!({
+    "by_tag": { "terms": { "field": "tags" } }
+}))?;
+let coll = AggregationCollector::from_aggs(agg, AggContextParams::default());
+searcher.search(&AllQuery, &coll)?;
+// → error: field "tags" is not configured as a fast field
+```
+
+Switch the declaration to `STRING | FAST` and the column appears alongside the
+inverted index. The same `terms` aggregation now works: tantivy walks each matched
+`DocId`, reads its tag value(s) from the fast-field column, and tallies a count
+per distinct value:
+
+```text
+"by_tag": {
+  "buckets": [
+    { "key": "rust",         "doc_count": 412 },
+    { "key": "search-engine","doc_count": 318 },
+    { "key": "Lucene-like",  "doc_count":  77 },
+    ...
+  ]
+}
+```
+
+That tally — one row per distinct value with its document count — is what "bucket"
+means: grouping documents into a bucket per value. Same idea for `FacetCollector`
+(buckets along a hierarchy) and for sorting (read each doc's value, then order). All
+three need the DocId → value direction, so all three need `FAST`.
 
 If you want hierarchical tag navigation (e.g. `/lang/rust`, `/topic/search`), use a
 **facet** field instead — `add_facet_field` is built for exactly that.
+
+---
+
+### 3.1.2 What does `INDEXED` actually do?
+
+`INDEXED` is **not reserved to numerics**. It is the "build the inverted index for this
+field" flag, exposed by every non-text option struct that carries one: `NumericOptions`
+(used by `add_u64_field`, `add_i64_field`, `add_f64_field`, **and `add_bool_field`** —
+bool shares NumericOptions, there is no separate `BoolOptions`), `DateOptions`,
+`IpAddrOptions`, and `BytesOptions`. Text fields don't have a separate `INDEXED` flag
+because indexing is **implicit** in the choice of `TEXT` (tokenised + positions) or
+`STRING` (un-tokenised, `IndexRecordOption::Basic`); a text field that is neither `TEXT`
+nor `STRING` is simply not indexed.
+
+**What index is built?** The same inverted index used for text — there is only one
+indexing data structure in tantivy:
+
+1. **Term encoding** — each value is converted to an order-preserving byte form before
+   being inserted as a "term" (every numeric/bool/date term is **8 bytes wide**, since
+   they all go through `Term::from_fast_value` which calls `to_u64().to_be_bytes()`,
+   `src/schema/term.rs:128–132`):
+   - `u64`: 8-byte big-endian
+   - `i64`: 8-byte big-endian after `(val as u64) ^ 0x8000_0000_0000_0000` — sign-bit
+     flip, equivalent to `val − i64::MIN`, so negatives sort first
+   - `f64`: 8-byte big-endian after Lemire's order-preserving mapping (positives flip
+     the MSB; negatives bitwise-NOT all bits — `common::f64_to_u64`)
+   - `bool`: 8-byte big-endian (`u64::from(self).to_be_bytes()` — `false` = 8 zero
+     bytes, `true` = `0x00…01`)
+   - `date`: stored as nanos internally but **truncated to seconds** at indexing time
+     (`DATE_TIME_PRECISION_INDEXED = Seconds`), then encoded like `i64`
+   - `IpAddr`: canonical 16-byte big-endian (v4 mapped into v6)
+   - `bytes`: the raw bytes
+2. **Term dictionary** — these encoded terms are inserted into the same `.term`
+   structure as text terms: an FST mapping `term-bytes → TermOrdinal` over an SSTable
+   mapping `TermOrdinal → TermInfo` (per-block prefix compression on keys, bitpacked
+   + delta-encoded `TermInfo`).
+3. **Posting list** — same `.idx` file: 128-doc bitpacked blocks of sorted DocId
+   deltas, VInt tail. Non-text fields use `IndexRecordOption::Basic` (DocIds only —
+   no frequencies, no positions, since those are meaningless for a single numeric
+   value).
+
+The big payoff is **range queries**: order-preserving encoding makes
+`price BETWEEN 5.0 AND 20.0` a single byte-range scan of the term dictionary between
+`encode(5.0)` and `encode(20.0)`, then a union of the resulting posting lists — no
+special "BKD-tree" or numeric-tree (Lucene has one; tantivy does not).
+
+#### Cost: yes, one posting list per distinct value
+
+Treating each distinct number as its own term has a real cost. For an `INDEXED` integer
+field, tantivy creates **one term-dictionary entry and one posting list per distinct
+integer that appears in any document**. So:
+
+- A `rating` field with values `{1, 2, 3, 4, 5}` over 1 M docs → 5 posting lists,
+  ~200 K DocIds each. Tiny dictionary, dense compressible postings — cheap.
+- A `price_cents` field with ~10 K distinct values → 10 K posting lists, average
+  ~100 DocIds each. Still fine; the SSTable's per-block bitpacking and the 128-doc
+  posting blocks keep the per-term overhead small.
+- A `timestamp_ms` field with ~1 M distinct values across 1 M docs → ~1 M posting
+  lists, **most of length 1**. Now the dictionary is the dominant cost, and the FST's
+  prefix-sharing collapses (timestamps have low prefix entropy), so the FST is close
+  to incompressible. A range query that touches a wide window walks every distinct
+  value in the range — potentially hundreds of thousands of `TermInfo` lookups.
+
+**Rule of thumb.** Use `INDEXED` for numeric fields when the cardinality is small to
+moderate, or when you need exact `TermQuery` lookups (e.g. status codes, ratings,
+year, IDs you'll search by exact value). For high-cardinality numerics where you only
+need range queries / sorting / aggregations, use `FAST` instead — the column store is a
+single mmapped flat array indexed by `DocId`, with no per-value dictionary overhead.
+Tantivy's `RangeQuery` can then satisfy the range by scanning the column and filtering
+DocIds (the "fast field scan" strategy in §12 of `impl_tutorial.md`).
+
+For "I want both": `INDEXED | FAST` is a valid combination, but pay the cardinality
+cost only if you actually need both code paths.
+
+| Situation | Recommended flags |
+|-----------|-------------------|
+| Low-cardinality category (rating, status, year) | `INDEXED \| FAST` (or `INDEXED \| STORED` if no aggregation) |
+| Mid-cardinality lookup field (postal code, SKU) | `INDEXED` (+ `STORED` for retrieval) |
+| High-cardinality numeric used for ranges/sort only (timestamp_ms, price_cents) | `FAST` (no `INDEXED`) |
+| Exact lookup by primary id | `STRING` (text) — same trade-off as `INDEXED` for non-text |
 
 ---
 
@@ -931,12 +1130,23 @@ together.
    only after the next reader reload (manual `reload()` or the background policy).
    Acquiring a `Searcher` between `delete_term` and `commit` returns the previous
    snapshot in which the doc is still alive.
-4. Yes. `delete_term` deletes every document containing the given term in the given
-   field — the title field has both "Frankenstein" and "The Modern Prometheus" as
-   indexed terms (well, after tokenisation, the individual tokens), so the doc
-   matches and is tombstoned. There is no "match all values" semantics — one matching
-   term is enough. This is why for delete-by-key you should use a `STRING` field with
-   a unique id and call `delete_term` against that id.
+4. **It depends on the field's analyser, and `delete_term` does *not* re-run it.**
+   `delete_term(term)` is implemented (`src/indexer/index_writer.rs:680–686`) as
+   `delete_query(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))` — the
+   term is passed through verbatim. Three cases:
+   - **`title` is `TEXT`** (default analyser lowercases): the indexed terms are
+     `frankenstein`, `the`, `modern`, `prometheus`. `Term::from_field_text(title, "Frankenstein")`
+     carries the literal bytes `Frankenstein` (capital F), which is **not** in the
+     dictionary — *the doc is not deleted*. Pass the lowercased form
+     (`"frankenstein"`) or run the field's analyser yourself before constructing the
+     `Term`.
+   - **`title` is `STRING`** (raw tokenizer, case-preserving): the indexed term is
+     exactly `Frankenstein`, the call matches, and the doc *is* deleted — and `STRING`
+     also makes the second value `The Modern Prometheus` match its own literal queries.
+   - **General rule**: there is no "match all values" semantics — *one* matching
+     indexed term is enough to delete the doc. This is why for stable delete-by-key
+     you should use a dedicated `STRING` field carrying a unique id and call
+     `delete_term` against that id, not against a tokenised field.
 
 ### Exercise B — Index and commit lifecycle
 

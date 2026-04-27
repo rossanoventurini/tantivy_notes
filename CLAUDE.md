@@ -2,6 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Authoring `.md` notes — read the source first
+
+This repository is a set of study notes about tantivy. The upstream tantivy source tree
+is checked out at **`/home/rossano/tantivy_notes/tantivy/`** — the same paths cited
+throughout the notes (`src/postings/`, `src/termdict/`, `src/store/`, `src/query/`,
+`src/fastfield/`, …) plus the workspace crates (`sstable/`, `columnar/`, `bitpacker/`,
+`stacker/`, `common/`, `tokenizer-api/`, `ownedbytes/`, `query-grammar/`), an
+`ARCHITECTURE.md`, and `doc/`.
+
+**You must read the source and the in-tree documentation before writing or editing any
+`.md` file in this repo.** Do not generate explanations, code snippets, defaults
+(buffer sizes, block sizes, compression codec, API signatures, error names, …), or
+"source: …" citations from training memory — read the actual files. The notes are
+explicitly anchored to source locations (e.g. `src/postings/term_info.rs`), so every
+claim should be checkable by opening the cited file.
+
+Concretely, when adding or revising notes:
+
+1. Start from the relevant module under `tantivy/src/` (or workspace crate); read the
+   types, traits, and public API actually defined there.
+2. Cross-check with `tantivy/ARCHITECTURE.md` and `tantivy/doc/` for design intent.
+3. For numeric defaults (block sizes, cache sizes, buffer sizes, compression
+   constants), grep for the constant in the source and quote it — do not estimate.
+4. For API examples, copy the real signature (modules, traits, generic params) from
+   the current source. Tantivy's API has shifted across versions; do not rely on
+   recalled signatures.
+5. Cite the file (and line range when useful) the same way the existing notes do:
+   `Source: src/postings/term_info.rs:NN–MM`.
+
+If a claim cannot be grounded in the source after reading, say so in the note rather
+than inventing a plausible-sounding answer.
+
 ## Commands
 
 ```bash

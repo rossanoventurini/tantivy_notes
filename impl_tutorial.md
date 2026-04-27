@@ -183,29 +183,37 @@ lookups.
 
 | Field type | Encoding |
 |-----------|----------|
-| `text` | UTF-8 bytes |
+| `text` | UTF-8 bytes (one term per token after analysis) |
 | `u64` | 8-byte big-endian |
-| `i64` | 8-byte big-endian, sign bit flipped (so negatives come before positives) |
-| `f64` | 8-byte big-endian, sign and exponent bits adjusted for signed ordering |
-| `bool` | 1 byte: 0 or 1 |
-| `date` | Same as i64 (microseconds since epoch) |
+| `i64` | 8-byte big-endian after `(val as u64) ^ 0x8000_0000_0000_0000` (sign-bit flip — equivalent to `val − i64::MIN`, so negatives sort before positives) |
+| `f64` | 8-byte big-endian after Lemire's order-preserving mapping: positive values XOR the MSB; negative values bitwise-NOT all bits (`common::f64_to_u64`) |
+| `bool` | 8-byte big-endian (`u64::from(self).to_be_bytes()` — `false` = 8 zero bytes, `true` = `0x00…01`) |
+| `date` | Internally an `i64` of nanoseconds; **truncated to seconds** at indexing time (`DATE_TIME_PRECISION_INDEXED = Seconds`, `src/schema/date_time_options.rs:9`), then encoded like `i64` |
+| `IpAddr` | 16-byte big-endian, IPv4 mapped into IPv6 (`Ipv6Addr::to_u128().to_be_bytes()`) |
+| `bytes` / `facet` | raw bytes |
 
 The big-endian encoding means that for two values `a < b`, the byte representation of `a` is
 lexicographically less than the byte representation of `b`. A numeric range `[lo, hi]` is
 therefore equivalent to a byte-range `[encode(lo), encode(hi)]` in the term dictionary.
 
-**Memory implications of the encoding choice.** Every term carries a small header (the field
-id, 4 bytes, plus a 1-byte type tag) prepended to its payload, so the on-disk term length is
-`header + payload`. Numeric and date payloads are fixed-width (1 B for `bool`, 8 B for
-`u64`/`i64`/`f64`/`date`), which makes block layout in the dictionary regular and
-prefix-sharing trivial within a numeric range. Text payloads are variable-length UTF-8 and
-are capped (`MAX_TOKEN_LEN`, configurable, default a few tens of bytes) — long tokens are
-silently truncated rather than allowed to bloat the dictionary. The size of the term
-dictionary on disk is therefore driven by the **cardinality of distinct values per field**
-(plus the per-term header), not by the number of documents — a million docs that share a
-small vocabulary cost less than a million docs each with a unique high-entropy id.
+**Memory implications of the encoding choice.** A `Term` (`src/schema/term.rs:23–26`) is a
+`(Field, Vec<u8>)` pair. The serialized in-memory form is `[field_id: 4 B big-endian]
+[type_tag: 1 B][payload]`; the term dictionary is built **per-field per-segment**, so what
+ends up as a key inside the FST is just the `[type_tag][payload]` part — the field id
+identifies which dictionary, not which key inside it. Numeric, bool and date payloads are
+fixed-width (8 B for every `u64`/`i64`/`f64`/`bool`/`date`, 16 B for `IpAddr`), which makes
+block layout in the dictionary regular and prefix-sharing trivial across a numeric range.
+Text payloads are variable-length UTF-8. The default `"default"` analyser
+(`src/tokenizer/tokenizer_manager.rs:60–65`) chains `SimpleTokenizer + RemoveLongFilter::limit(40) + LowerCaser`,
+so tokens longer than **40 bytes are *dropped* (filtered out)** before they ever reach the
+dictionary — they are not truncated. `STRING` fields use the `"raw"` tokenizer with no
+length filter, so STRING values can be arbitrarily long. The size of the term dictionary on
+disk is therefore driven by the **cardinality of distinct values per field** (plus the
+per-term type-tag), not by the number of documents — a million docs that share a small
+vocabulary cost less than a million docs each with a unique high-entropy id.
 
-Source: `src/schema/term.rs:275–292`.
+Source: `src/schema/term.rs`, `src/tokenizer/tokenizer_manager.rs:53–81`,
+`columnar/src/column_values/monotonic_mapping.rs:115–187`.
 
 ### 3.2 The term dictionary (.term)
 
@@ -259,25 +267,35 @@ allocate nothing on the heap. The build phase, however, requires keys to arrive 
 order and keeps a small in-memory buffer of unfinished states — that bounds writer memory
 during segment flush regardless of vocabulary size.
 
-**SSTable (Layer 2) — compression.** The `TermInfoStore` is laid out as fixed-size blocks of
-~N consecutive `TermInfo` records (with a sparse in-memory block index pointing to each
-block's offset). Inside a block:
+**SSTable (Layer 2) — compression.** The `TermInfoStore`
+(`src/termdict/fst_termdict/term_info_store.rs`) is laid out as fixed-size blocks of
+**`BLOCK_LEN = 256`** consecutive `TermInfo` records (line 12). Each block is described by a
+`TermInfoBlockMeta` carrying:
 
-- `doc_freq` is **bitpacked** to the minimum bit width needed by the largest value in the
-  block (Lucene's PFOR-style block compression, but simpler: a single bit-width per column).
-- `postings_range.start` and `positions_range.start` are **monotonically increasing** across
-  ordinals, so they are stored as **deltas** from the block's base offset and then bitpacked.
-  The `end` of one range is the `start` of the next, so only one offset per record is
-  actually written.
+- the file `offset` of the block's bitpacked body,
+- a `ref_term_info` (the **first** `TermInfo` of the block, stored uncompressed),
+- three independent bit-widths (`doc_freq_nbits`, `postings_offset_nbits`,
+  `positions_offset_nbits`) — one per column.
 
-This is why a `TermInfo` lookup is O(1): given the ordinal, divide by block size to find the
-block, slice the mmap, decode the bitpacked column at the in-block offset.
+The remaining 255 entries inside the block are encoded as bitpacked **deltas relative to the
+block's `ref_term_info`**. Because `postings_range.start` and `positions_range.start` are
+monotonically increasing across ordinals, the offsets stay small within a block and pack
+cheaply. The `end` of one range is just the `start` of the next, so only one offset per
+column per record is actually written (`deserialize_term_info` reads
+`posting_start` for the current ordinal and `posting_start` for the next ordinal as the end
+— see lines 62–92).
 
-**SSTable — memory implications.** Only the block index is held in RAM (a few bytes per
-block, so kilobytes for millions of terms); block bodies are paged in on demand. Per-block
-bitpacking means that a block of 16–64 cheap terms (small `doc_freq`, small offset deltas)
-costs only a few bits per field, while a block containing one very frequent term widens the
-bit-width for the whole block — locality of cardinality matters slightly for size.
+This is why a `TermInfo` lookup is O(1): `block_id = term_ord / 256`; jump into the block
+metadata at `block_id × sizeof(TermInfoBlockMeta)`; then decode the bitpacked columns at
+`inner_offset = term_ord % 256` (lines 138–153).
+
+**SSTable — memory implications.** The store consists of two `OwnedBytes` slices held by
+`TermInfoStore` (lines 96–100): the block-meta array and the bitpacked term-info bodies.
+Both are mmap-backed by the `.term` file — there is no separate "index in RAM"; what stays
+resident is just the OS page cache for the pages actually touched. Per-block bitpacking
+means that a block of 256 cheap terms (small `doc_freq`, small offset deltas) costs only a
+few bits per column, while a block containing one very frequent term widens the bit-width
+for the entire 256-entry block — locality of cardinality matters slightly for size.
 
 **Putting the two together.** For a text field with strong vocabulary sharing the FST
 typically dominates the term dictionary's space; for numeric or id-like fields it shrinks to
@@ -287,8 +305,9 @@ integers* — lets each layer use the compression scheme best suited to its payl
 
 Note on related files (covered later): the `.idx` posting lists use 128-doc bitpacked
 blocks (with a VInt-encoded tail), positions in `.pos` are bitpacked similarly, and the
-`.store` docstore compresses blocks of stored documents with LZ4 by default (or Zstd /
-Brotli via feature flags) — see the corresponding sections.
+`.store` docstore compresses blocks of stored documents with **LZ4 by default** (Zstd is
+the only other option, behind the `zstd-compression` feature; the full set per
+`src/store/compressors.rs` is `none | lz4 | zstd`) — see the corresponding sections.
 
 ### Questions
 
@@ -591,19 +610,24 @@ Source: `src/query/bm25.rs:58–66`.
 
 ### Answers
 
-1. Both end up in the same fieldnorm bucket. The 8-bit fieldnorm encoding is roughly
-   logarithmic, with one bucket per distinct length only at the small end; at lengths
-   in the 40s the buckets are already wide enough that 41 and 42 typically share the
-   same id. The decoded `dl` for both will be identical (and slightly off from the true
-   token count — the encoding is lossy on purpose).
+1. They land in **different** ids — the table is identity for IDs 0–40 and then jumps to
+   even spacings (`FIELD_NORMS_TABLE` in `src/fieldnorm/code.rs`: id 40 = length 40, id 41
+   = length 42, id 42 = length 44, …). `fieldnorm_to_id` does a binary search and returns
+   `idx − 1` on a miss, so 41 tokens → **id 40** (decoded back to 40 — a one-token
+   underestimate), and 42 tokens → **id 41** (decoded back to 42 exactly). The
+   ground-truth test in `code.rs:281–286` makes this explicit: `assert_eq!(fieldnorm_to_id(41), 40); assert_eq!(fieldnorm_to_id(42), 41);`.
 2. BM25 only ever uses `dl / avgdl`, a ratio. Relative differences matter much more
    between short documents (a 1-token title vs a 5-token title is a 5× ratio change)
    than between long ones (10 000 vs 10 050 is a 0.5 % change with no real effect on
-   ranking). A log scale spends precision where it changes scores and saves it where it
-   doesn't, all in one byte per doc.
-3. Almost the same. Both lengths fall into the same coarse bucket high on the log
-   scale, so the decoded `dl` values are essentially equal and the BM25
-   length-normalisation factor is unchanged.
+   ranking). The exact-then-exponential scale (identity up to 40, then growing
+   spacings — see `code.rs:13–270`) spends precision where it changes scores and saves
+   it where it doesn't, all in one byte per doc.
+3. Almost the same — but in **adjacent** buckets, not the same one. Looking at
+   `FIELD_NORMS_TABLE`, 100 000 tokens → id 115 (decoded as 98 328) and 110 000 tokens
+   → id 116 (decoded as 106 520). The decoded `dl` values differ by ~8 k, which on a
+   typical `avgdl` produces a tiny BM25 length-normalisation difference — far smaller
+   than the ~10 % gap in raw lengths would suggest, because the table is coarse at this
+   scale.
 
 ---
 
@@ -732,9 +756,17 @@ Source: `src/query/bm25.rs:95–145`.
    contributes nothing to the score — the BM25 way of saying "stop word".
 2. `IDF = ln(1 + (1 000 000 - 2 + 0.5) / (2 + 0.5)) = ln(1 + 999 998.5 / 2.5)
    = ln(1 + 399 999.4) ≈ ln(400 000) ≈ 12.9`.
-3. Numerator: `tf × (K1 + 1) = 1 × 2.2 = 2.2`. Denominator:
-   `tf + K1 × (1 - B + B × dl/avgdl) = 1 + 1.2 × (0.25 + 0.75 × 0.5)
-   = 1 + 1.2 × 0.625 = 1.75`. **TF ≈ 1.257**.
+3. Two equivalent ways to write this — pick the one matching how you split the formula:
+   - **Tantivy's split form** (used in §9.2 above and in `Bm25Weight::tf_factor`,
+     `src/query/bm25.rs:188–193`): `weight = IDF × (K1+1)`,
+     `tf_factor = tf / (tf + cache[fieldnorm_id])`, where
+     `cache = K1 × (1 − B + B × dl/avgdl) = 1.2 × (0.25 + 0.75 × 0.5) = 0.75`.
+     So **`tf_factor = 1 / (1 + 0.75) ≈ 0.571`** — this is what `tf_factor` returns in
+     the source.
+   - **Classical textbook form**: fold `(K1+1)` into the TF expression, giving
+     `tf × (K1+1) / (tf + K1 × (1 − B + B × dl/avgdl)) = 2.2 / 1.75 ≈ 1.257`.
+   The final BM25 contribution `weight × tf_factor` is the same in both — just whether
+   the `(K1+1)` factor sits in `weight` or in the TF term.
 4. The term is essentially everywhere — `n ≈ N`, i.e. it behaves like a stop word
    (think "the", "is"). It contributes almost nothing to ranking; presence vs absence
    barely moves the score.
@@ -863,8 +895,9 @@ that started before the merge completed continue to use the old segments safely.
 ### Answers
 
 1. With the default `LogMergePolicy`, a merge fires when there are enough
-   similarly-sized segments in one tier (default `min_merge_size = 8`). After ~8
-   single-segment commits the policy picks them up and schedules a merge on the
+   similarly-sized segments in one tier (default `min_num_segments = 8`,
+   `DEFAULT_MIN_NUM_SEGMENTS_IN_MERGE` in `src/indexer/log_merge_policy.rs:10`). After
+   ~8 single-segment commits the policy picks them up and schedules a merge on the
    indexer's background thread pool — so the *first* merge is queued shortly after the
    8th commit and runs asynchronously.
 2. Merging copies only the live documents into a new segment. The deleted ones are

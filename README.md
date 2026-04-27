@@ -46,3 +46,17 @@ git pull
 
 The notes are written against a specific tantivy commit. After updating the submodule,
 run `git diff` inside `tantivy_notes/` to see which tantivy commit the notes now reference.
+
+## Building `amazon_indexer` against the submodule
+
+The `amazon_indexer` crate depends on the local Tantivy source at `../tantivy`.
+Make sure the submodule has been initialised before building:
+
+```bash
+git submodule update --init --recursive
+cd amazon_indexer
+cargo build --release
+```
+
+If you update `tantivy/` to a different commit, rebuild `amazon_indexer` so Cargo
+uses the local submodule checkout.
