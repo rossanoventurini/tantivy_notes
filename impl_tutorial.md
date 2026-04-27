@@ -84,6 +84,27 @@ Source: `src/index/index_meta.rs`.
 4. A segment has `max_doc = 10 000` and `num_deleted_docs = 3 000`. What fraction of the
    segment's bytes is wasted? When will those bytes be reclaimed?
 
+### Answers
+
+1. One segment is flushed, so the writer produces one file per active component of that
+   segment plus an updated `meta.json` — typically `.term`, `.idx`, `.pos`, `.fast`,
+   `.fieldnorm`, `.store` (six segment files), and `meta.json`. No `.del` is written
+   because nothing has been deleted on a freshly-built segment, and `.pos` is omitted if
+   no field requested positions.
+2. `meta.json` is the authoritative list of live segments (UUID, `max_doc`, deletes
+   generation, schema). It is written to a temporary file and `rename(2)`d into place so
+   readers always see either the old or the new commit — never a partially-updated index.
+   This is what makes a commit atomic.
+3. Up to 4 — one per indexing thread, but only threads that actually buffered documents
+   flush a segment. So the answer is `min(num_threads, num_threads_with_docs)`: 0 if no
+   docs were added, up to 4 otherwise.
+4. ~30 % of the live data area (3 000 / 10 000 docs) is dead weight, but the cost is
+   smaller than that because deletes only mark documents as gone; the inverted index
+   entries, fast fields and stored docs for them remain on disk. Those bytes are
+   reclaimed only when the segment is **merged** with one or more others by the merge
+   policy — the merge rewrites only the live documents into a new segment and the old
+   files are unlinked.
+
 ### Exercise I-1 — Inspect a real index
 
 Create a small index with the amazon_indexer or any tantivy program. After committing, run:
@@ -122,6 +143,21 @@ a `segment_ord` to disambiguate.
 3. You search across 3 segments. The top result is `DocAddress { segment_ord: 1, doc_id: 42 }`.
    What does segment_ord 1 mean?
 
+### Answers
+
+1. Sequential allocation makes the DocId space dense (`[0, max_doc)` with no gaps), and
+   density is the precondition for every compression scheme used downstream: posting
+   lists are sorted-ascending → small deltas → tight bitpacking; the alive bitset is one
+   bit per DocId; fast fields are flat columns indexed by DocId. Random or sparse IDs
+   would defeat all three.
+2. The bitset is sized by `max_doc`, not by the live count: `ceil(5000 / 8) = 625` bytes.
+   Whether 4 800 or 200 docs are alive, the array is the same size — what changes is the
+   number of set bits.
+3. `segment_ord` is the index of the segment within the `Searcher`'s ordered list of
+   `SegmentReader`s. `segment_ord = 1` means "the second segment in this snapshot". It
+   is **not** stable across reopens: a commit, a merge, or a new searcher can reshuffle
+   the ordering. The persistent identity is the segment's UUID in `meta.json`.
+
 ---
 
 ## 3. The Inverted Index — Term to DocIds
@@ -158,6 +194,17 @@ The big-endian encoding means that for two values `a < b`, the byte representati
 lexicographically less than the byte representation of `b`. A numeric range `[lo, hi]` is
 therefore equivalent to a byte-range `[encode(lo), encode(hi)]` in the term dictionary.
 
+**Memory implications of the encoding choice.** Every term carries a small header (the field
+id, 4 bytes, plus a 1-byte type tag) prepended to its payload, so the on-disk term length is
+`header + payload`. Numeric and date payloads are fixed-width (1 B for `bool`, 8 B for
+`u64`/`i64`/`f64`/`date`), which makes block layout in the dictionary regular and
+prefix-sharing trivial within a numeric range. Text payloads are variable-length UTF-8 and
+are capped (`MAX_TOKEN_LEN`, configurable, default a few tens of bytes) — long tokens are
+silently truncated rather than allowed to bloat the dictionary. The size of the term
+dictionary on disk is therefore driven by the **cardinality of distinct values per field**
+(plus the per-term header), not by the number of documents — a million docs that share a
+small vocabulary cost less than a million docs each with a unique high-entropy id.
+
 Source: `src/schema/term.rs:275–292`.
 
 ### 3.2 The term dictionary (.term)
@@ -191,6 +238,58 @@ to slice the `.idx` mmap directly.
 
 Source: `src/termdict/mod.rs`, `sstable/`.
 
+### 3.3 Memory and compression of the term dictionary
+
+Both layers are designed to live on disk and be consulted via `mmap`, so the **resident set**
+at runtime is just the OS page cache for the pages actually touched — never the full
+dictionary. Hot terms stay warm; cold ones cost a page-in but no allocation.
+
+**FST (Layer 1) — compression.** The FST is a *minimised* deterministic finite automaton:
+common **prefixes** (like Lucene's prefix trie) and common **suffixes** (which a plain trie
+cannot share) are merged into the same state. Output bytes (the term ordinals) are pushed as
+far up toward the root as possible so transitions carry partial outputs that sum along the
+path — this lets the structure encode a `term → u64` mapping with a state count typically
+much smaller than the number of terms. For natural-language text this routinely yields a few
+bits per term; for high-cardinality opaque ids (UUIDs, hashes) sharing collapses and the FST
+size approaches one node per character, so it ends up close to a sorted concatenation of the
+keys plus the ordinal outputs.
+
+**FST — memory implications.** Lookups are O(|term|) byte comparisons against mmap and
+allocate nothing on the heap. The build phase, however, requires keys to arrive in sorted
+order and keeps a small in-memory buffer of unfinished states — that bounds writer memory
+during segment flush regardless of vocabulary size.
+
+**SSTable (Layer 2) — compression.** The `TermInfoStore` is laid out as fixed-size blocks of
+~N consecutive `TermInfo` records (with a sparse in-memory block index pointing to each
+block's offset). Inside a block:
+
+- `doc_freq` is **bitpacked** to the minimum bit width needed by the largest value in the
+  block (Lucene's PFOR-style block compression, but simpler: a single bit-width per column).
+- `postings_range.start` and `positions_range.start` are **monotonically increasing** across
+  ordinals, so they are stored as **deltas** from the block's base offset and then bitpacked.
+  The `end` of one range is the `start` of the next, so only one offset per record is
+  actually written.
+
+This is why a `TermInfo` lookup is O(1): given the ordinal, divide by block size to find the
+block, slice the mmap, decode the bitpacked column at the in-block offset.
+
+**SSTable — memory implications.** Only the block index is held in RAM (a few bytes per
+block, so kilobytes for millions of terms); block bodies are paged in on demand. Per-block
+bitpacking means that a block of 16–64 cheap terms (small `doc_freq`, small offset deltas)
+costs only a few bits per field, while a block containing one very frequent term widens the
+bit-width for the whole block — locality of cardinality matters slightly for size.
+
+**Putting the two together.** For a text field with strong vocabulary sharing the FST
+typically dominates the term dictionary's space; for numeric or id-like fields it shrinks to
+near-incompressible and the bitpacked SSTable becomes the larger of the two. The deliberate
+split — an FST that is *good at strings* on top of a columnar store that is *good at
+integers* — lets each layer use the compression scheme best suited to its payload.
+
+Note on related files (covered later): the `.idx` posting lists use 128-doc bitpacked
+blocks (with a VInt-encoded tail), positions in `.pos` are bitpacked similarly, and the
+`.store` docstore compresses blocks of stored documents with LZ4 by default (or Zstd /
+Brotli via feature flags) — see the corresponding sections.
+
 ### Questions
 
 1. Why is `u64` stored big-endian rather than little-endian in the term dictionary?
@@ -199,6 +298,28 @@ Source: `src/termdict/mod.rs`, `sstable/`.
 3. A term has `doc_freq = 0`. Is it possible? What would `postings_range` be?
 4. The FST maps Term → TermOrdinal. Why is this ordinal needed? Why not map directly to
    TermInfo?
+
+### Answers
+
+1. Big-endian preserves numeric order in lexicographic byte order: for `a < b`, the bytes
+   of `a` are also less than the bytes of `b`. Little-endian puts the least-significant
+   byte first, so `0x0001 = 256` would compare smaller than `0x0100 = 1` byte-wise. The
+   range-query trick "numeric range = byte-range scan of the term dictionary" only works
+   under big-endian (with the sign/exponent fix-ups for `i64`/`f64`).
+2. Tantivy encodes `10.0` and `50.0` to their 8-byte signed-adjusted big-endian forms,
+   then performs a **byte-range scan** of the term dictionary between those two
+   encodings. Each term met along the way is mapped through the SSTable to a `TermInfo`,
+   and the union of the resulting posting lists yields the matching DocIds.
+3. No. A term that ends up in the dictionary was emitted by the writer because at least
+   one document contained it, so `doc_freq ≥ 1`. A `doc_freq = 0` would also imply an
+   empty `postings_range` (`start == end`), which the writer never produces.
+4. The ordinal is a small, contiguous, bitpackable handle that buys columnar storage of
+   term statistics. With `Term → TermInfo` directly in the FST, every transition would
+   carry a variable-width payload (doc_freq + two `usize` offsets), inflating the FST
+   and losing the SSTable's per-block tricks: monotonic offsets stored as deltas,
+   `doc_freq` bitpacked to the block's max, single in-RAM block index. The split lets
+   the FST do what it is good at (compressing strings) and the SSTable do what it is
+   good at (compressing columns of integers).
 
 ### Exercise I-2 — Manual term lookup
 
@@ -270,6 +391,32 @@ Source: `src/postings/`, `src/docset.rs`.
 4. `IndexRecordOption::Basic` vs `WithFreqs` vs `WithFreqsAndPositions` — what data is stored
    for each option? When is each appropriate?
 
+### Answers
+
+1. `300 / 128 = 2` full bitpacked blocks (256 docs); the remaining `300 - 256 = 44` docs
+   are written to the **VInt-encoded tail block** (variable-byte deltas), because the
+   bitpacker only operates on full 128-doc groups. The skip list indexes only the
+   bitpacked blocks; the tail is always read sequentially.
+2. Sorted-ascending DocIds have small consecutive gaps; bitpacking picks one bit-width
+   per block of 128, equal to the max delta's bit-length. Typical gaps need 3–8 bits,
+   while absolute IDs in a million-doc segment need ~20 bits — a 3–6× expansion if you
+   skipped the delta step. Worse, the per-block max would scale with the largest
+   absolute id rather than the largest local gap, so even one large doc would widen the
+   whole block.
+3. The skip list stores, per block, the largest DocId in that block. Intersecting "war"
+   ∩ "peace" advances by `seek(target)`: a binary search over the skip list jumps
+   straight to the first block whose max ≥ target, and only that block is decompressed.
+   Blocks whose max is below the next candidate are skipped entirely — the docs they
+   contain are never decoded.
+4. - `Basic`: just sorted DocIds. Use for Boolean filters and queries that don't score
+     on the term (e.g. occur clauses where the score is irrelevant).
+   - `WithFreqs`: DocIds **plus per-doc term frequency**. Required for BM25 / TF-IDF
+     scoring on that field.
+   - `WithFreqsAndPositions`: also per-doc token positions (in the `.pos` file).
+     Required for phrase, proximity, span and "near" queries. Roughly doubles the
+     posting-list footprint, so don't enable it on fields that never need phrase
+     matching.
+
 ### Exercise I-3 — Block counting
 
 Index a large text corpus (e.g. the Amazon reviews dataset). For a common term like "good",
@@ -304,6 +451,21 @@ Source: `src/positions/`, `src/query/phrase_query/`.
 2. A field is indexed with `STRING`. Can you run a phrase query on it? Why?
 3. The phrase query `"quick brown fox"` does not match "quick and brown fox" (there is an
    extra word). How does the position comparison detect this mismatch?
+
+### Answers
+
+1. "fox" appears at token positions 1 and 4 (positions are zero-based: `the=0, fox=1,
+   ate=2, the=3, fox=4`). The two positions are stored as deltas from 0 — `[1, 3]` —
+   bitpacked in the `.pos` file inside the position block belonging to the `<fox, doc>`
+   posting entry, with `term_freq = 2` recorded in the `.idx` file.
+2. No. `STRING` indexes the whole field as a single, untokenised term, so there are no
+   per-token positions to compare and the field carries no `.pos` data. A phrase query
+   needs `IndexRecordOption::WithFreqsAndPositions` on a tokenised `TEXT` field.
+3. The phrase scorer requires that for each consecutive pair `(t_i, t_{i+1})` of query
+   terms there is a position `p` for `t_i` and `p + 1` for `t_{i+1}` in the same doc.
+   In "quick and brown fox" the positions are `quick=0, and=1, brown=2, fox=3`. The
+   pair `(quick=0, brown)` would need brown at position 1, but brown is at 2 — gap of
+   2, not 1 — so the candidate is rejected without ever needing to look at `fox`.
 
 ---
 
@@ -357,6 +519,20 @@ skip DocIds with a 0 alive bit.
 2. Why is column-oriented storage faster than row-oriented storage (the docstore) for
    aggregations?
 3. The alive bitset is consulted for every matched DocId. Why is this not expensive?
+
+### Answers
+
+1. `range = max - min + 1 = 64 536`; `bits = ceil(log2(64 536)) = 16` bits per doc. For
+   1 M docs: `16 × 1 000 000 / 8 = 2 000 000` bytes ≈ **2 MB** (header excluded).
+2. An aggregation reads one field from many documents. Column storage keeps that field's
+   values contiguous on disk and indexed by `DocId`, so `N` reads stream `N × bits/8`
+   bytes — sequential, prefetcher-friendly, often page-cache-resident. The docstore is
+   row-oriented and stores all `STORED` fields of a document together, LZ4-compressed
+   in 16 KB blocks; reading one field per doc forces decompressing whole blocks of
+   unrelated fields, an order-of-magnitude waste in CPU and bytes touched.
+3. The bitset is a flat byte array indexed by `DocId`: a single load + bit-test, O(1)
+   and branch-friendly. A 1 M-doc bitset is 125 KB, comfortably in L2 cache, so the
+   per-doc cost is essentially a memory-resident bit lookup.
 
 ### Exercise I-4 — Fast field access
 
@@ -413,6 +589,22 @@ Source: `src/query/bm25.rs:58–66`.
 3. If two documents have 100 000 and 110 000 tokens respectively, will BM25 treat them
    differently or almost the same? Why?
 
+### Answers
+
+1. Both end up in the same fieldnorm bucket. The 8-bit fieldnorm encoding is roughly
+   logarithmic, with one bucket per distinct length only at the small end; at lengths
+   in the 40s the buckets are already wide enough that 41 and 42 typically share the
+   same id. The decoded `dl` for both will be identical (and slightly off from the true
+   token count — the encoding is lossy on purpose).
+2. BM25 only ever uses `dl / avgdl`, a ratio. Relative differences matter much more
+   between short documents (a 1-token title vs a 5-token title is a 5× ratio change)
+   than between long ones (10 000 vs 10 050 is a 0.5 % change with no real effect on
+   ranking). A log scale spends precision where it changes scores and saves it where it
+   doesn't, all in one byte per doc.
+3. Almost the same. Both lengths fall into the same coarse bucket high on the log
+   scale, so the decoded `dl` values are essentially equal and the BM25
+   length-normalisation factor is unchanged.
+
 ---
 
 ## 8. The Docstore (.store) — Retrieving Stored Fields
@@ -448,6 +640,22 @@ This is fine for 10 results on a SERP. For 100 000 matched documents it is catas
    repeats the same 10 documents, how many decompression calls happen in total?
 3. You want to retrieve a `rating: f64` field for the top 10 000 matched documents during
    aggregation. Should you use the docstore or a fast field? Why?
+
+### Answers
+
+1. Total raw payload ≈ `1000 × 2 KB = 2 MB`. Compressed at LZ4 ratios for natural
+   language (~2×), the docstore lands around 1 MB, i.e. ~64 blocks of 16 KB
+   (uncompressed), with each block holding ~8 documents. Ten random docs almost
+   certainly fall in 10 distinct blocks → **10 decompressions** (8 if two pairs happen
+   to share a block).
+2. The first 100 unique blocks miss the cache → 100 decompressions to fill it. The 10
+   repeat documents reuse blocks already in the cache → 0 additional decompressions.
+   **Total: 100.**
+3. Fast field, every time. The docstore would force LZ4-decompressing entire 16 KB
+   blocks containing all stored fields for every co-located doc — many MB of waste to
+   read a few tens of KB of `f64`s. A `f64` fast field gives O(1) random access per
+   `DocId` over a contiguous column. The CLAUDE.md rule of thumb (≤ ~100 docstore hits
+   per query) exists exactly for this reason.
 
 ---
 
@@ -516,6 +724,21 @@ Source: `src/query/bm25.rs:95–145`.
 4. You run `explain()` and see that the IDF contribution is 0.0001. What does this tell you
    about the query term?
 
+### Answers
+
+1. `IDF = ln(1 + (N - n + 0.5) / (n + 0.5))`. With `n ≈ N` the argument approaches
+   `ln(1 + 0.5/(N + 0.5)) ≈ 0`, so a doc matching "the" gets essentially **0** from
+   the IDF factor. The TF factor is also multiplied by IDF, so the term effectively
+   contributes nothing to the score — the BM25 way of saying "stop word".
+2. `IDF = ln(1 + (1 000 000 - 2 + 0.5) / (2 + 0.5)) = ln(1 + 999 998.5 / 2.5)
+   = ln(1 + 399 999.4) ≈ ln(400 000) ≈ 12.9`.
+3. Numerator: `tf × (K1 + 1) = 1 × 2.2 = 2.2`. Denominator:
+   `tf + K1 × (1 - B + B × dl/avgdl) = 1 + 1.2 × (0.25 + 0.75 × 0.5)
+   = 1 + 1.2 × 0.625 = 1.75`. **TF ≈ 1.257**.
+4. The term is essentially everywhere — `n ≈ N`, i.e. it behaves like a stop word
+   (think "the", "is"). It contributes almost nothing to ranking; presence vs absence
+   barely moves the score.
+
 ### Exercise I-5 — Reproduce BM25 by hand
 
 1. Index 5 documents with varying body lengths and a shared term (e.g. "ocean").
@@ -574,6 +797,22 @@ its own segment on commit. This is why committing with N threads can produce N n
    thread 2 indexes documents 2, 4, 6 — are the DocIds in each segment contiguous or
    interleaved?
 
+### Answers
+
+1. The FST and SSTable are built **streaming**, single-pass, in sorted byte order. The
+   FST builder requires keys to arrive in lexicographic order so it can emit minimised
+   states as it goes; the SSTable's per-block prefix compression and monotonic offset
+   deltas also rely on sorted input. The terms accumulated in memory by `stacker`
+   during indexing are sorted at flush time exactly to satisfy this.
+2. Zero. With no buffered docs in any thread, no segment is flushed. `meta.json` is
+   only rewritten if there is *some* state change to record (e.g. pending deletes); a
+   completely empty commit is essentially a no-op.
+3. **Contiguous within each segment.** Each indexing thread owns its own
+   `SegmentWriter` and assigns DocIds locally in arrival order. Thread 1's segment has
+   docs `[0, 1, 2]` for what the user added as "documents 1, 3, 5"; thread 2's segment
+   has docs `[0, 1, 2]` for "2, 4, 6". The original add-order numbering is not
+   preserved — DocIds are segment-local handles, not global identifiers.
+
 ---
 
 ## 11. Segment Merges — Background Housekeeping
@@ -620,6 +859,23 @@ that started before the merge completed continue to use the old segments safely.
 2. A merged segment has no `.del` file. Why? (Think about what merging does to deleted docs.)
 3. A reader is holding a snapshot that includes old segment A. A merge completes and deletes
    segment A's files. Does the reader crash? Why?
+
+### Answers
+
+1. With the default `LogMergePolicy`, a merge fires when there are enough
+   similarly-sized segments in one tier (default `min_merge_size = 8`). After ~8
+   single-segment commits the policy picks them up and schedules a merge on the
+   indexer's background thread pool — so the *first* merge is queued shortly after the
+   8th commit and runs asynchronously.
+2. Merging copies only the live documents into a new segment. The deleted ones are
+   simply not emitted, so the merged segment starts with `num_deleted_docs = 0` and no
+   `.del` file is needed. The "rebirth" is what reclaims the wasted bytes from §1 Q4.
+3. No. Tantivy uses reference-counted file handles via the `Directory` abstraction.
+   The reader still holds an mmap on segment A's files; even after the merger
+   `unlink`s the paths, the underlying inodes stay alive on POSIX filesystems until
+   the last open fd / mmap is dropped. The reader continues to see segment A's data
+   for the rest of its lifetime; the next `IndexReader::reload()` will pick up the
+   merged segment instead.
 
 ---
 
@@ -676,6 +932,25 @@ fields that have both `INDEXED` and `FAST`, you can also manually construct a
    documents, is this slow? Why or why not?
 3. What property of the byte encoding makes it possible to turn a numeric range into a
    byte-range scan of the term dictionary?
+
+### Answers
+
+1. The inverted-index strategy walks the term dictionary's byte-range
+   `[encode(0), encode(1 000 000)]` and unions the posting list of every distinct value
+   met along the way. With 10 000 distinct prices that's **10 000 term-info lookups**
+   plus 10 000 posting-list slices to be merged. The cost grows with cardinality, not
+   with range width, which is why this strategy gets expensive fast for high-cardinality
+   numeric fields and why the fast-field scan exists.
+2. Not slow on its own. A 16-bit packed `u64` fast field over 5 M docs is ~10 MB of
+   contiguous bytes — sequential reads, prefetcher-friendly, and easily page-cache
+   resident. Whether it beats the inverted-index strategy depends on selectivity: dense
+   ranges or high-cardinality fields favour the column scan; very selective ranges
+   (a handful of distinct values) favour the term-dictionary path.
+3. The encoding is **order-preserving**: lexicographic byte order matches numeric
+   order (big-endian, with the sign bit flipped for `i64` and the sign + exponent
+   adjustment for `f64`). That means the term dictionary, sorted by bytes, is also
+   sorted by value, so a numeric `[lo, hi]` becomes a single byte-range
+   `[encode(lo), encode(hi)]` scan with no per-key conversion needed.
 
 ### Exercise I-6 — Range query performance
 
@@ -753,6 +1028,24 @@ Source: `src/query/query.rs`, `src/query/weight.rs`, `src/query/scorer.rs`.
    Describe how the intersection is computed efficiently given that both are sorted.
 3. A custom `Scorer` that always returns `score() = 1.0` — what query type would this
    correspond to semantically?
+
+### Answers
+
+1. In the **Weight** (specifically when `Bm25Weight` is constructed). The IDF depends
+   only on collection statistics — `N` (doc count) and `n` (`doc_freq`) — and is the
+   same for every matching doc. Computing it per-`Scorer` would repeat constant work;
+   computing it per-`Weight` lets the per-doc Scorer multiply a precomputed scalar by
+   the per-doc TF.
+2. Both `DocSet`s yield DocIds in ascending order, so the intersection is a galloping
+   merge: hold the smaller scorer's current doc, call `seek(target)` on the other; if
+   it lands on the same doc → emit, otherwise advance the smaller one to the larger's
+   doc and repeat. The skip list inside each posting list lets `seek` jump entire
+   128-doc blocks instead of scanning, so the cost is roughly proportional to the size
+   of the smaller posting list, not to the union.
+3. A **constant-score** scorer — semantically a Boolean *filter* clause (a `must`
+   used only for matching, not ranking) or a `ConstScoreQuery`. Anything that is
+   yes/no with no relevance signal: returning a fixed score keeps the scoring
+   machinery happy while contributing nothing to ordering.
 
 ---
 

@@ -33,6 +33,23 @@ Beyond full-text search, tantivy also supports:
    What does it give you?
 3. Name three query types that tantivy supports beyond basic keyword search.
 
+### Answers
+
+1. Tantivy is a **library**; Elasticsearch is a **server**. You link tantivy into your
+   Rust process and call its API directly — no daemon, no HTTP layer, no JVM. ES wraps
+   Lucene in a distributed service with replication, sharding, REST/JSON, and a
+   cluster manager. Tantivy gives you the search engine; you build everything else
+   around it (or use a project like Quickwit that does so on top of tantivy).
+2. No HTTP server. Tantivy gives you in-process Rust APIs: `Schema`, `Index`,
+   `IndexWriter`, `IndexReader`/`Searcher`, query and collector traits. You bring your
+   own transport (axum, actix, tonic, etc.) and call into the library from your
+   handlers.
+3. Three of: phrase queries (`PhraseQuery`), fuzzy queries (`FuzzyTermQuery`), range
+   queries on numeric/date/bool fields (`RangeQuery`), Boolean queries
+   (`BooleanQuery`), regex queries (`RegexQuery`), facets (`FacetCollector`),
+   aggregations (`terms`, `histogram`, `range`, metric aggregations like `avg`/`sum`),
+   "more like this" (`MoreLikeThisQuery`), disjunction-max (`DisjunctionMaxQuery`).
+
 ---
 
 ## 2. The Mental Model
@@ -469,6 +486,22 @@ Key rules:
 3. What is the difference between `TEXT` and `STRING` for the value `"New York"`?
    What happens when you search for `"york"` on each?
 
+### Answers
+
+1. Yes — searching matches because `TEXT` indexes the field. But you cannot print the
+   body: `TEXT` alone does not include `STORED`, so the original value is not in the
+   docstore and `doc.get_first(body)` returns `None`. To both search and display, use
+   `TEXT | STORED`.
+2. `price` needs `FAST` (column store, for sorting and reading per `DocId`) and
+   `STORED` (so the original value can be returned in the result). Typical declaration:
+   `add_f64_field("price", FAST | STORED)`. Numeric fields don't need `INDEXED` for
+   sorting alone; add it (`INDEXED | FAST | STORED`) only if you also want range
+   queries through the inverted index.
+3. `TEXT` runs the default tokeniser: `"New York"` becomes tokens `[new, york]`
+   (lowercased), and a search for `"york"` matches. `STRING` indexes the whole value
+   as a single untokenised, case-sensitive term `"New York"`; a search for `"york"`
+   does **not** match — only the exact term `"New York"` does.
+
 ### Exercise A — Schema choices
 
 For each field below, choose the right combination of options and justify:
@@ -477,6 +510,50 @@ For each field below, choose the right combination of options and justify:
 - `published_at`: datetime, used for date-range filtering and sorting by recency.
 - `author_name`: full-text searchable, also displayed in results.
 - `view_count`: used for sorting by popularity and for aggregations; never displayed.
+
+---
+
+### 3.1.1 Multi-valued STRING fields (tags)
+
+A common case is a field that holds a small set of independent labels — tags, categories,
+codes — where each label must be searchable as a whole token. `STRING` is the right
+choice: it indexes the value as a single un-tokenised, case-preserving term, and tantivy
+supports adding the same field multiple times per document.
+
+```rust
+let mut doc = TantivyDocument::default();
+doc.add_text(tags, "rust");
+doc.add_text(tags, "search-engine");
+doc.add_text(tags, "Lucene-like");
+```
+
+Each `add_text` call appends another term to the `tags` posting list for that document.
+A query for any single tag is an exact `TermQuery`:
+
+```rust
+TermQuery::new(
+    Term::from_field_text(tags, "search-engine"),
+    IndexRecordOption::Basic,
+)
+```
+
+…or via the parser: `tags:search-engine`.
+
+**Caveats specific to STRING:**
+
+- **Exact and case-sensitive.** `tags:Rust` ≠ `tags:rust`. For case-insensitive matching,
+  lowercase tags before indexing or use a custom analyser that runs only `LowerCaser`
+  (treated as a TEXT field with `IndexRecordOption::Basic`).
+- **No partial matches.** Substrings, prefixes, and whitespace splits don't work — the
+  term is the whole tag. For prefix search use `RegexQuery` or a tokenised TEXT field.
+- **Multi-valued = several terms in the same posting list.** A query for `"rust"`
+  matches any document that added `"rust"` to `tags`, regardless of the other tags it
+  carries.
+- **Aggregations / facets / sort.** Add `FAST` (`STRING | FAST`) so each tag value can
+  be read as a column entry per `DocId`. Without `FAST` you can search but not bucket.
+
+If you want hierarchical tag navigation (e.g. `/lang/rust`, `/topic/search`), use a
+**facet** field instead — `add_facet_field` is built for exactly that.
 
 ---
 
@@ -647,6 +724,24 @@ schema_builder.add_facet_field("category", FacetOptions::default());
 3. Can you use `add_text_field` with `STRING` for a field you also want to aggregate on?
    What is missing?
 
+### Answers
+
+1. No — `FAST | STORED` lets you sort by the value and return it, but range queries
+   need the **inverted index**. Add `INDEXED`: `NumericOptions::default().set_indexed()
+   .set_fast().set_stored()` (or the equivalent shorthand). Without `INDEXED`, the
+   term dictionary has no entries for `timestamp_ms` and the byte-range scan that
+   powers a `RangeQuery` finds nothing.
+2. `add_bytes_field` stores opaque `Vec<u8>` blobs (e.g. embeddings, IDs, image
+   hashes) — no parsing, no inverted-index expansion, just a typed raw byte field
+   you can index/store/fast. `add_json_field` stores structured JSON: tantivy walks
+   the object and indexes each leaf as a sub-field with type detection (text,
+   numeric, bool), so you can query nested paths like `meta.user.id` without
+   declaring each leaf in the schema.
+3. Yes — `STRING` is fine for aggregation buckets (you usually *want* the value
+   un-tokenised so `"New York"` stays one bucket). What's missing is `FAST`:
+   aggregations read column values per `DocId` and require the field to be a fast
+   field. Use `STRING | FAST` (and add `STORED` if you also want to display it).
+
 ---
 
 ### 3.4 Full schema example
@@ -694,6 +789,19 @@ the schema and the list of segments. You never need to edit it manually.
    happens? (Check the API.)
 2. You build an in-RAM index for a unit test. After the test, is the data persisted anywhere?
 3. What file does tantivy write first when creating a new index?
+
+### Answers
+
+1. `create_in_dir` fails (returns `Err`) if the directory already contains an index —
+   it refuses to clobber existing data. Use `Index::open_in_dir` to attach to an
+   existing index, or `Index::open_or_create` to do whichever is appropriate.
+2. No. A `RamDirectory` lives entirely in process memory; when the test process exits
+   the index is gone. For a persistent test artifact, use `MmapDirectory::open(path)`
+   instead.
+3. `meta.json` — the empty index manifest, written atomically. Without it,
+   `Index::open_in_dir` cannot recognise the directory as an index. As segments are
+   later flushed, segment files appear and `meta.json` is rewritten (atomically) to
+   reference them.
 
 ---
 
@@ -807,6 +915,28 @@ together.
    document be absent from the new searcher's results?
 4. A document has two `title` values: "Frankenstein" and "The Modern Prometheus". You call
    `delete_term(Term::from_field_text(title, "Frankenstein"))`. Is the document deleted?
+
+### Answers
+
+1. No, they are not searchable yet — they live in the writer's in-memory buffer and
+   in a per-thread WAL-style state, but no segment exists for any reader to attach to.
+   If the process is killed, the buffered docs are lost: the index reverts to the last
+   committed state (commit is the only durability boundary).
+2. Tantivy holds a process-level **directory lock** (`.tantivy-writer.lock`) on the
+   directory. The second `.writer(...)` call fails with a lock error — only one
+   `IndexWriter` can be open against a given directory at a time, regardless of which
+   process is asking.
+3. No. `delete_term` only registers a tombstone in the writer's pending state; the
+   delete becomes durable on `commit()`, and the deletion becomes visible to readers
+   only after the next reader reload (manual `reload()` or the background policy).
+   Acquiring a `Searcher` between `delete_term` and `commit` returns the previous
+   snapshot in which the doc is still alive.
+4. Yes. `delete_term` deletes every document containing the given term in the given
+   field — the title field has both "Frankenstein" and "The Modern Prometheus" as
+   indexed terms (well, after tokenisation, the individual tokens), so the doc
+   matches and is tombstoned. There is no "match all values" semantics — one matching
+   term is enough. This is why for delete-by-key you should use a `STRING` field with
+   a unique id and call `delete_term` against that id.
 
 ### Exercise B — Index and commit lifecycle
 
@@ -1137,6 +1267,43 @@ let q = BooleanQuery::new(vec![
    search? What problem does it solve?
 6. What is the difference between `ConstScoreQuery(q, 0.0)` and `MustNot` in a BooleanQuery?
 
+### Answers
+
+1. `Should` means "may match"; the document is *not* required to match it
+   individually. With **only** `Should` clauses, however, BooleanQuery degenerates
+   into "match at least one" — a doc matching zero `Should`s is excluded. Mix in
+   `Must` or `MustNot` and the `Should`s become purely additive (they boost the score
+   when present but no longer gate matching).
+2. The `2` is the maximum **Levenshtein edit distance** — up to 2 single-character
+   insertions, deletions, or substitutions to reach an indexed term (e.g. `whale` ↔
+   `whales` is 1, `whale` ↔ `wales` is 2). The `true` is `transposition_cost_one`:
+   adjacent-character swaps count as a single edit (Damerau-Levenshtein) instead of
+   two.
+3. ```rust
+   use std::ops::Bound;
+   use tantivy::query::RangeQuery;
+   use tantivy::schema::Type;
+   use tantivy::Term;
+
+   RangeQuery::new(
+       Bound::Included(Term::from_field_f64(price, 5.0)),
+       Bound::Included(Term::from_field_f64(price, 20.0)),
+   )
+   ```
+4. Wrap the words in double quotes inside the parser input — `"\"quick brown\""`.
+   That tells `QueryParser` to build a `PhraseQuery` for the `default_field` (or
+   construct one programmatically with `PhraseQuery::new(vec![Term::from_field_text
+   (field, "quick"), Term::from_field_text(field, "brown")])`).
+5. Prefer `DisjunctionMaxQuery` for *the same query, multiple fields* (title vs body
+   vs tags). `BooleanQuery(Should)` **adds** the per-field BM25 scores, which double-
+   counts and rewards docs whose match is split mediocrely across fields.
+   `DisjunctionMaxQuery` returns `max(scores) + tie_breaker × Σ(others)` — the doc
+   gets the score of its *best* field, with a small bonus for additional matches.
+   This avoids the "best of any one field" loss that plain disjunction suffers.
+6. `ConstScoreQuery(q, 0.0)` *includes* matching docs with score 0; `MustNot` *excludes*
+   them. The first is "match this but contribute nothing to ranking"; the second is
+   "remove these docs entirely from the result set".
+
 ### Exercise C — Query construction
 
 Write a function `fn search_books(searcher: &Searcher, keyword: &str, min_price: f64, max_price: f64)`
@@ -1286,6 +1453,30 @@ let count    = count_handle.extract(&mut results);
 5. `tweak_score` uses a two-level closure. Why two levels? What work happens in the outer
    closure vs the inner closure?
 
+### Answers
+
+1. The score field becomes `Option<f64>` (the type parameter of the order-by-fast-field
+   collector). `None` means the document does not have a value for the `price` fast
+   field — typically because the field was not set at indexing time. With `Order::Asc`,
+   tantivy's fast-field collector treats missing values according to the API's null
+   policy; usually they sort at one end of the range, but rely on the type — `None`
+   in your `Vec` is the explicit signal "no price for this doc".
+2. `MultiCollector`. Register both `TopDocs::with_limit(10)` and `Count`, run a single
+   `searcher.search(&q, &multi)`, then unpack the two handles. One pass over the
+   matching docs feeds both collectors.
+3. With `Order::Asc`, missing values typically sort **last** (effectively `+∞` so
+   present values come first). Verify with the variant of `order_by_fast_field` you
+   call — there are knobs to flip this — but the safe assumption is "absent = pushed
+   to the end on ascending sort".
+4. ```rust
+   TopDocs::with_limit(10).and_offset(20)   // page 3 → skip 20, take 10
+   ```
+5. The outer closure runs **once per segment** and returns the inner closure; this is
+   where you open expensive per-segment readers (fast-field readers, alive bitset,
+   stored-field handle). The inner closure runs **once per matched DocId in that
+   segment** and computes the tweaked score using the readers captured by the outer
+   one. Two levels = pay segment-setup cost N times, not N × matches times.
+
 ---
 
 ### 6.5 Scoring and BM25
@@ -1345,6 +1536,25 @@ Or via the query parser: `title:whale^3 body:whale`.
 4. You want title matches to count 3× more than body matches. How do you express this with
    the `QueryParser`?
 
+### Answers
+
+1. **Document A.** BM25's length-normalisation factor `1 - B + B × dl/avgdl` shrinks
+   the contribution from longer documents. A 5-word title has a tiny `dl`, so its TF
+   contribution is barely discounted; a 500-word body has `dl ≫ avgdl`, so the same
+   single occurrence is heavily damped. Plus, average title lengths are typically
+   smaller, lowering `avgdl` for that field.
+2. The Boolean AND scorer **sums** the per-term BM25 contributions:
+   `score(d) = bm25(sea, d) + bm25(whale, d)`. Each term is scored independently
+   against the doc, then added; there is no cross-term interaction in the formula.
+3. `IDF = ln(1 + (N - n + 0.5) / (n + 0.5))`. For "the", `n ≈ N`, so the argument is
+   ≈ `1`, and `ln(1) = 0`. A near-zero IDF means matching "the" contributes almost
+   nothing to the score — the BM25 way of automatically downweighting stop words
+   without an explicit stop-word list.
+4. Use the parser's per-field boost syntax: `^N` after the field name in the
+   parser's field-boost map, or by writing the query as `title:foo^3 OR body:foo`.
+   With `QueryParser::set_field_boost(title, 3.0)` you get the same effect for every
+   query the parser produces.
+
 ### Exercise D — Score explanation
 
 Using an in-memory index with at least 5 books, search for a keyword that matches multiple
@@ -1384,12 +1594,73 @@ during scoring. Use `FAST` fields for per-document data access during collection
 
 As a rule of thumb: **do not hit the docstore more than ~100 times per query**.
 
+### 7.1 Fetching a document by id
+
+Tantivy has **no primary-key get API**. Every document fetch goes through
+**search → DocAddress → docstore**. Two cases come up in practice:
+
+**1. By tantivy's internal `DocId`** (segment-local `u32`) — direct, but rarely what
+you want:
+
+```rust
+let addr = DocAddress { segment_ord: 0, doc_id: 42 };
+let doc: TantivyDocument = searcher.doc(addr)?;
+```
+
+The internal `DocId` is **not stable**: it shifts when segments merge, and `segment_ord`
+shifts when the searcher snapshot changes. Never persist it; treat it as valid only
+within the snapshot that produced it (e.g. the `TopDocs` you just collected).
+
+**2. By an application-level id** (the stable id you control). Index it as a `STRING`
+field — `STRING` for exact match, `STORED` only if you also want to read it back — and
+look it up with a `TermQuery`:
+
+```rust
+let id_f = schema.get_field("id").unwrap();
+let term = Term::from_field_text(id_f, "user-123");
+let query = TermQuery::new(term, IndexRecordOption::Basic);
+
+let hits = searcher.search(&query, &TopDocs::with_limit(1))?;
+if let Some((_, addr)) = hits.first() {
+    let doc: TantivyDocument = searcher.doc(*addr)?;
+    // doc now contains every STORED field
+}
+```
+
+Practical points:
+
+- **`STORED` alone is not searchable.** Such a field has no inverted-index entry; it
+  is pure payload, retrievable only via a `DocAddress` you obtained by some other
+  means.
+- **One `searcher.doc(addr)` returns every `STORED` field.** You don't fetch them
+  individually.
+- **Cost.** Docstore reads decompress 16 KB LZ4 blocks with a small LRU cache. A few
+  by-id lookups per request is fine; thousands is the wrong tool — use a fast field.
+- **Uniqueness is your job.** Tantivy does not enforce id uniqueness. To upsert,
+  call `writer.delete_term(Term::from_field_text(id_f, "user-123"))` followed by
+  `add_document(...)` and one `commit()`.
+
 ### Questions
 
 1. You call `doc.get_first(body)` but `body` was declared as `TEXT` (not `STORED`). What do
    you get?
 2. A document was indexed with two `title` values. `doc.get_first(title)` returns which one?
 3. Why is accessing a `FAST` field during scoring fine, but accessing the docstore is not?
+
+### Answers
+
+1. `None`. `TEXT` only indexes the field; the original value is not in the docstore.
+   You searched it successfully, but you cannot retrieve it. To do both, declare the
+   field as `TEXT | STORED`.
+2. The **first** value that was added with `doc.add_text(title, ...)`, in insertion
+   order. To iterate all values, use `doc.get_all(title)` which returns an iterator
+   over every value stored for that field.
+3. A fast field is a flat, mmapped column indexed by `DocId`: O(1), no decompression,
+   stays in the page cache for hot fields. The docstore is row-oriented and **LZ4-
+   compressed in 16 KB blocks**: reading one field forces decompressing the whole
+   block containing all stored fields of all docs in that block. Doing that per
+   matching document during scoring is many MB of waste per query (CLAUDE.md gives
+   the rule of thumb: ≤ ~100 docstore hits per query).
 
 ### Exercise E — Selective retrieval
 
@@ -1446,6 +1717,22 @@ to extract an excerpt.
    instead, but the matched term only appears in `body`?
 3. You want to highlight a field that is `TEXT` but not `STORED`. Is snippet generation
    possible? Why?
+
+### Answers
+
+1. `&*query` reborrows through the smart pointer (e.g. `Box<dyn Query>` or
+   `Arc<dyn Query>`): `*query` dereferences to the underlying `dyn Query`, then `&`
+   takes a reference, giving the `&dyn Query` that `SnippetGenerator::create`
+   expects. The `*` is what unwraps the box; `&` rebuilds a borrow at the right type.
+2. The snippet is built from the text of the **field passed to the generator**, not
+   from where the match lives. If you pass `title` but the matched terms only appear
+   in `body`, the generator scans the title text, finds no matching tokens, and
+   returns an empty (or fallback) snippet. Snippet field must match the field whose
+   matches you want to highlight.
+3. No. The snippet generator needs the original text to render around the matched
+   terms — and the original text only lives in the docstore, which requires
+   `STORED`. A `TEXT`-only field is searchable but its text is not retrievable, so
+   there is nothing to highlight against.
 
 ---
 
