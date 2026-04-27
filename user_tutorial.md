@@ -1015,12 +1015,20 @@ let mut writer: IndexWriter = index.writer(50_000_000)?;
 ```
 
 **There can be at most one `IndexWriter` per index at a time**, even across processes. Tantivy
-uses a file lock (`meta.lock`) to enforce this. If a second writer tries to acquire the lock,
-it will fail immediately with an error.
+uses a non-blocking file lock — `.tantivy-writer.lock`, defined as `INDEX_WRITER_LOCK` in
+`src/directory/directory_lock.rs:45–48` — to enforce this. If a second writer tries to
+acquire the lock, the call fails immediately with an error (the lock has
+`is_blocking: false`, so it does not wait). There is a separate `.tantivy-meta.lock`
+(`META_LOCK`, line 57) used for read-side protection during `IndexReader::reload()`,
+not for the writer.
 
-The writer is multithreaded internally: it spawns one indexing thread per CPU core
-(configurable with `writer_with_num_threads`). Each thread independently builds its own
-in-memory buffer and flushes one segment on commit.
+The writer is multithreaded internally: `index.writer(memory_budget)` picks
+`min(num_cpus, MAX_NUM_THREAD = 8)` indexing threads (`src/index/index.rs:613–622`), so
+even on a 32-core machine you get 8 by default. The `memory_budget` argument is the
+**overall** budget; tantivy divides it across the chosen number of threads. Use
+`writer_with_num_threads(num_threads, overall_memory_budget_in_bytes)` to override the
+thread count explicitly. Each thread independently builds its own in-memory buffer and
+flushes one segment on commit.
 
 ### 5.2 Building and adding documents
 
@@ -1293,14 +1301,22 @@ the same query term in many fields.
 ```rust
 use tantivy::query::DisjunctionMaxQuery;
 
-let q = DisjunctionMaxQuery::with_tie_breaking_boost(
+// With a tie breaker (small additive boost for matching multiple disjuncts):
+let q = DisjunctionMaxQuery::with_tie_breaker(
     vec![
         Box::new(TermQuery::new(Term::from_field_text(title, "rust"), IndexRecordOption::WithFreqs)),
         Box::new(TermQuery::new(Term::from_field_text(body,  "rust"), IndexRecordOption::WithFreqs)),
     ],
-    0.1,  // tie-breaking boost for multi-field matches
+    0.1,  // tie breaker — score = max(disjuncts) + tie_breaker × Σ(others)
 );
+
+// Or no tie breaker — pure max:
+// let q = DisjunctionMaxQuery::new(vec![ ... ]);
 ```
+
+Two constructors (`src/query/disjunction_max_query.rs:114–129`):
+`DisjunctionMaxQuery::new(disjuncts)` (pure max, tie breaker = 0.0) and
+`DisjunctionMaxQuery::with_tie_breaker(disjuncts, tie_breaker)`.
 
 Use `DisjunctionMaxQuery` instead of `BooleanQuery(Should)` when you want "best field wins"
 semantics rather than score accumulation.
@@ -1353,8 +1369,13 @@ use tantivy::query::FuzzyTermQuery;
 let q = FuzzyTermQuery::new(
     Term::from_field_text(title, "whail"),
     1,     // max Levenshtein edit distance (insertions, deletions, substitutions)
-    true,  // also match as prefix (last char may be incomplete)
+    true,  // transposition_cost_one — adjacent-char swap = 1 edit (Damerau-Levenshtein)
+           //                          (false → swap = 2 edits)
 );
+
+// For prefix-style fuzzy match ("starts with...", typo-tolerant), use the sibling:
+// FuzzyTermQuery::new_prefix(term, distance, transposition_cost_one)
+//   — `src/query/fuzzy_query.rs:103`.
 ```
 
 #### PhraseQuery — ordered sequence of terms
@@ -2012,6 +2033,34 @@ let hits  = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
 2. How is a drill-down query (filter to one facet) different from a facet count?
 3. Can a document belong to multiple facets? How?
 
+### Answers
+
+1. Only **direct children of the requested root** are counted. Quoting
+   `src/collector/facet_collector.rs:50–58`: "Facet counts will only be computed for the
+   facet that are direct children of such a root facet." So adding `/Electronics` to
+   the collector produces a count for `/Electronics/Laptops` (one level deep — the
+   doc's path traverses it) but **not** for `/Electronics/Laptops/Gaming`. To drill
+   down, add the deeper root explicitly (`add_facet("/Electronics/Laptops")`), and you
+   get a count for `/Electronics/Laptops/Gaming`. The hierarchy is consulted via the
+   `Facet` byte representation (NUL-separated path segments — see
+   `facet_depth` in the same file, line 40), not via JSON traversal.
+2. **Drill-down is matching, facet count is collection.** A facet count uses the
+   `FacetCollector` over whatever query you ran (often `AllQuery`) to *count*
+   documents per direct sub-facet of the root you registered — it answers "how many
+   docs are under each sub-category of `/Fiction`?". A drill-down restricts the
+   *result set* to documents whose facet is below a specific path, by adding a
+   `TermQuery` on `Term::from_facet(field, facet)` (or using
+   `Index::query_parser` shortcuts) into the Boolean query. They compose: drill
+   down with a Boolean filter, then run a FacetCollector on the filtered set to
+   get sub-counts within that branch.
+3. Yes — `add_facet_field` accepts `FacetOptions`, and a document can carry
+   multiple facet values for the same field by calling
+   `doc.add_facet(facet_field, Facet::from(...))` more than once. Each path is
+   indexed independently and the document is counted once per distinct
+   ancestor at the requested root depth (so a doc with both
+   `/Fiction/SciFi` and `/Fiction/Fantasy` contributes `+1` to each direct child
+   when the root is `/Fiction`).
+
 ### Exercise F — Faceted catalogue
 
 Build an index of 12 books with a `genre` facet field:
@@ -2087,6 +2136,37 @@ sub-aggregation on the documents in each bucket.
 3. You run `terms` aggregation on a `TEXT` field tokenised with the default tokeniser. A
    value `"New York"` gets tokenised into `"new"` and `"york"`. What bucket keys will you see?
    How should the field be configured to get `"New York"` as a single bucket?
+
+### Answers
+
+1. Combine a **`terms`** bucket (`src/aggregation/bucket/term_agg.rs`) on the
+   category field with two **metric sub-aggregations**, `min` and `max`
+   (`src/aggregation/metric/min.rs`, `max.rs`), on price. Equivalent JSON:
+   ```json
+   {
+     "by_category": {
+       "terms": { "field": "category" },
+       "aggs": {
+         "min_price": { "min": { "field": "price" } },
+         "max_price": { "max": { "field": "price" } }
+       }
+     }
+   }
+   ```
+2. **`FAST`.** From `src/aggregation/mod.rs:13–14`: *"aggregations work only on fast
+   fields. Fast fields of type `u64`, `f64`, `i64`, `date` and fast fields on text
+   fields."* No `FAST` → the engine cannot read values per `DocId` and the
+   aggregation errors out (the same DocId → value column-store path that bucketing
+   needs in §3.1.1).
+3. The default analyser lowercases and splits on punctuation/whitespace, so the
+   indexed terms are `new` and `york`. The `terms` aggregation reads the tokens
+   from the inverted index / fast-field column, so you get **two buckets**:
+   `{"key": "new", "doc_count": …}` and `{"key": "york", "doc_count": …}` — never
+   `"New York"`. To bucket on the un-tokenised whole value, declare the field as
+   `STRING | FAST` (or use the multi-field pattern from §3.1's Exercise A: keep
+   the searchable `TEXT | STORED` field and add a sibling `STRING | FAST`
+   field carrying the same value, and aggregate on the sibling). For
+   hierarchical labels (`/cities/us/ny/new_york`), use a facet field instead.
 
 ### Exercise G — Aggregation pipeline
 
@@ -2259,3 +2339,86 @@ Answer all of these before moving to the implementation tutorial.
     see the deleted document?
 12. What happens if you call `Index::create_in_dir` on a directory that already has a
     `meta.json`?
+
+### Answers
+
+1. **`TEXT`** runs the configured analyser (default = SimpleTokenizer +
+   RemoveLongFilter(40) + LowerCaser, `src/tokenizer/tokenizer_manager.rs:60–65`)
+   and stores positions (`IndexRecordOption::WithFreqsAndPositions`). Use it for
+   prose / searchable fields where partial matches and phrase queries matter.
+   **`STRING`** uses the `"raw"` tokenizer (no transformation, case-preserving,
+   no length filter) and `IndexRecordOption::Basic`. Use it for opaque values
+   that must match exactly: ids, tags, status codes, hex hashes.
+2. **No, you cannot search it** — `STORED` only fills the docstore and creates
+   no inverted-index entries. **Yes, you can retrieve it** with
+   `searcher.doc(addr)` once you've located the doc by some other means
+   (another field's `TermQuery`, a fast-field range, etc.). `STORED` alone is
+   pure payload.
+3. **Unchanged from the last successful commit.** The 1 000 buffered documents
+   lived only in the per-thread arena; `add_document` is not durable. On
+   restart, `meta.json` reflects only what `commit()` wrote, and the writer
+   lock (`.tantivy-writer.lock`) is released on process exit so a new writer
+   can be opened.
+4. A `Searcher` is a frozen view of a specific set of segment readers held by
+   `Arc`s. New commits do not change live `Searcher`s; they become visible only
+   after `IndexReader::reload()` (or the background reload policy) builds a new
+   snapshot. **Problem solved**: long-running operations — paginated requests,
+   running collectors, batch exports — see a self-consistent view of the index
+   from start to finish, even while writers and merges race in the background.
+   `DocAddress`es are also only meaningful within the snapshot that produced
+   them, which is why the snapshot identity matters.
+5. **`price` must have `FAST`.** `TopDocs::order_by_fast_field("price", Order::Asc)`
+   reads each match's value from the fast-field column at score time
+   (`src/collector/top_score_collector.rs:217–`). Sorting needs the DocId →
+   value direction (the "bucket" pattern of §3.1.1). `STORED` and `INDEXED`
+   are not sufficient.
+6. BM25's TF saturates because of the `tf / (tf + cache[fieldnorm_id])` shape
+   (`src/query/bm25.rs:188–193`): doubling `tf` does not double the factor. At
+   `tf = 1`, the factor ≈ `1 / (1 + 0.75) ≈ 0.57`; at `tf = 10`, the factor ≈
+   `10 / (10 + 0.75) ≈ 0.93`. So the 10th occurrence contributes
+   essentially nothing extra. The intuition: relevance is monotone in TF but
+   plateaus — a doc that mentions "whale" once is clearly *about* whales; a
+   doc that mentions it 100 times is not 100× more about them.
+7. `"cat sat"` **matches** — positions `cat=1, sat=2` differ by 1, so the
+   phrase scorer's "consecutive position" check passes (see §5 Q3 of
+   `impl_tutorial.md`). `"sat cat"` **does not match**: it would require
+   positions `sat=p, cat=p+1`, but the document has `cat=1, sat=2` — the gap
+   is `−1`, not `+1`.
+8. Up to **1 single-character edit** — one insertion, one deletion, **or** one
+   substitution. With `transposition_cost_one = true` (the
+   `FuzzyTermQuery::new(term, 1, true)` form), one adjacent-character swap
+   also counts as a single edit (Damerau-Levenshtein); with `false`, a
+   transposition is two edits and would not match at distance 1.
+9. **`terms` + `top_hits`.** `top_hits` is a metric sub-aggregation
+   (`src/aggregation/metric/top_hits.rs`) that returns the highest-scoring
+   documents within each parent bucket. JSON shape:
+   ```json
+   {
+     "by_subcat": {
+       "terms": { "field": "subcategory" },
+       "aggs": {
+         "examples": { "top_hits": { "size": 3 } }
+       }
+     }
+   }
+   ```
+   The `terms` bucket gives the doc-count per sub-category; the `top_hits`
+   sub-agg pulls the top 3 docs of each.
+10. Merges run on the `IndexWriter`'s background thread pool — the merger
+    opens its own segment writer, copies live docs, and only when the new
+    segment is fully flushed does it call `save_metas` to swap segments
+    atomically (`src/indexer/segment_updater.rs:248`). Searchers acquired
+    *before* the swap continue to use the old segments (their `Arc`s keep the
+    files alive on disk even after the merger unlinks them — see
+    `impl_tutorial.md` §11 Q3). Searchers acquired *after* `IndexReader::reload()`
+    see the new merged segment. So merges are invisible to existing
+    searchers and a soft cut-over for new ones.
+11. **Yes — the old searcher still sees the deleted document.** A `Searcher`
+    is bound to the snapshot at acquisition time; subsequent commits don't
+    affect it. Only after `IndexReader::reload()` and a new
+    `reader.searcher()` is the deletion visible. (The deletion itself was
+    queued by `delete_term` and applied to the alive bitset on commit — see
+    §5 Q3.)
+12. **It returns an error.** `Index::create_in_dir` refuses to clobber an
+    existing index. Use `Index::open_in_dir` to attach to an existing one,
+    or `Index::open_or_create` to do whichever fits. Same answer as §4 Q1.

@@ -47,16 +47,37 @@ git pull
 The notes are written against a specific tantivy commit. After updating the submodule,
 run `git diff` inside `tantivy_notes/` to see which tantivy commit the notes now reference.
 
-## Building `amazon_indexer` against the submodule
+## Running `amazon_indexer`
 
 The `amazon_indexer` crate depends on the local Tantivy source at `../tantivy`.
-Make sure the submodule has been initialised before building:
+Make sure the submodule has been initialised before building or running:
 
 ```bash
 git submodule update --init --recursive
-cd amazon_indexer
-cargo build --release
 ```
 
-If you update `tantivy/` to a different commit, rebuild `amazon_indexer` so Cargo
-uses the local submodule checkout.
+Download the Amazon Reviews 2023 `Video_Games` review JSONL. This is the category
+used by the demo queries in `amazon_indexer/src/search.rs`.
+
+```bash
+mkdir -p data
+curl -L --fail --continue-at - \
+  --output data/Video_Games.jsonl \
+  'https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/main/raw/review_categories/Video_Games.jsonl?download=true'
+```
+
+Build the index:
+
+```bash
+cd amazon_indexer
+cargo run --release --bin index -- ../data/Video_Games.jsonl indexes/video_games
+```
+
+Run the search demo:
+
+```bash
+cargo run --release --bin search -- indexes/video_games
+```
+
+If you update `tantivy/` to a different commit, rebuild/re-run `amazon_indexer` so
+Cargo uses the local submodule checkout.

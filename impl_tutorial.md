@@ -453,7 +453,25 @@ Positions are stored in a separate `.pos` file, pointed to by `TermInfo.position
 Within each document, positions are **delta-encoded** — store the difference between
 consecutive positions, not the absolute position.
 
-Example: tokens at positions `[2, 5, 9]` → stored as `[2, 3, 4]`.
+Example: tokens at positions `[2, 5, 9]` in one document → stored as deltas `[2, 3, 4]`.
+(Internally the writer encodes each position as `position + 1` with `prev_pos + 1`
+starting at `1`, so that `0` can act as a `POSITION_END` sentinel between docs —
+`src/postings/recorder.rs:240–267`. The user-visible delta sequence ends up the same.)
+
+The `.pos` file format per term (`src/positions/mod.rs`) is the same SIMD-bitpacked
+shape as posting lists: blocks of **128 deltas** (`COMPRESSION_BLOCK_SIZE =
+BitPacker4x::BLOCK_LEN`), one bit-width per block, plus a **VInt-encoded tail block**
+holding the last `count % 128` deltas. The per-term layout is:
+
+```
+NumBitPackedBlocks (VInt)              // = floor(P / 128)
+[ BitPackedPositionBlock × NumBitPackedBlocks ]   // 128 deltas each, packed at the
+                                                  // block's bit-width
+[ BitPackedPositionsDeltaBitWidth × NumBitPackedBlocks ]  // u8 per block, written *after*
+                                                          // the bodies so the reader can
+                                                          // skip-decode efficiently
+[ VIntPosDeltas? ]                      // up to 127 trailing deltas
+```
 
 When executing a phrase query for `["quick", "brown", "fox"]`, tantivy:
 1. Fetches the posting list for each term (DocIds where each term appears).
@@ -495,28 +513,34 @@ for sorting results, aggregations, and reading values during scoring.
 
 ### 6.1 Physical layout
 
-For a numeric fast field (e.g. `u64`), the data is stored as a column:
+Fast-field columns live in the `columnar` crate. Every numeric value is first mapped to a
+`u64` via `MonotonicallyMappableToU64` (the same mapping used to build numeric *terms*:
+identity for `u64`; sign-flip for `i64`/`date`; Lemire for `f64`; `u64::from(self)` for
+`bool`). The resulting `u64` column is then encoded with **one of three codecs**, chosen
+automatically by picking the cheapest estimated output
+(`columnar/src/column_values/u64_based/mod.rs:79–96`):
+
+| Codec | What it stores | Best for |
+|-------|----------------|---------|
+| `Bitpacked` | `min_value` + `num_bits` (= `ceil(log2(max − min + 1))`); each entry stored as `(value − min_value)` packed at `num_bits` bits | low amplitude, no obvious trend |
+| `Linear` | A fitted line `(slope, intercept)` between first and last value, plus per-entry deviations (bitpacked) | (near-)monotonically increasing data — timestamps, sequential ids |
+| `BlockwiseLinear` | A separate fitted line per **512-entry block**, plus per-entry deviations | locally linear data that drifts globally |
+
+For the simplest case, **`Bitpacked`**, fetching value for `DocId d` is:
 
 ```
-min_value: u64          (stored in the file header)
-num_bits:  u8           (bits needed to represent max_value - min_value)
-
-packed data: [(value[0] - min_value), (value[1] - min_value), ...]
-             all packed at `num_bits` bits each
-```
-
-Fetching value for `DocId d`:
-
-```
-bit_offset = num_bits * d
+bit_offset  = num_bits * d
 byte_offset = bit_offset / 8
-value = min_value + fetch_bits(data[byte_offset..], bit_offset % 8, num_bits)
+value_u64   = min_value + fetch_bits(data[byte_offset..], bit_offset % 8, num_bits)
+value       = T::from_u64(value_u64)   // inverse of the type's monotonic mapping
 ```
 
-This requires a single memory access (often a cache hit, since access patterns during search
-tend to be sequential). The `columnar` crate implements this logic.
+A single load (often a cache hit, since access patterns during scoring/sorting are
+typically sequential or close-to-sequential), one bit-mask, and the inverse mapping back
+to the user-visible type. `Linear`/`BlockwiseLinear` add a constant-time line evaluation
+on top.
 
-Source: `src/fastfield/`, `columnar/`.
+Source: `src/fastfield/`, `columnar/src/column_values/u64_based/`.
 
 ### 6.2 Multi-valued fast fields
 
@@ -786,30 +810,67 @@ Source: `src/query/bm25.rs:95–145`.
 ### 10.1 The Stacker (in-memory buffer)
 
 When you call `IndexWriter::add_document()`, the document is sent to one of the indexing
-threads via a channel. Each thread owns a `Stacker` — a hash map from `Term` to
-`(Vec<DocId>, Vec<TermFreq>, Vec<PositionDelta>)`.
+threads via a channel. Each thread owns a `SegmentWriter` whose inverted-index state lives
+in the `stacker` crate. The two key building blocks (`tantivy/stacker/src/lib.rs`):
 
-The Stacker accumulates documents until either:
-- The memory budget is exhausted (based on the `heap_size` passed to `writer()`), or
+- **`ArenaHashMap`** — an arena-allocated hash map from byte-string keys (the term bytes)
+  to a small per-term value (a head pointer into the `MemoryArena`).
+- **`ExpUnrolledLinkedList`** — an exponentially-growing unrolled linked list, allocated
+  inside the same arena. This is where the per-term postings (`DocId`, optional
+  `TermFreq`, optional position deltas) accumulate as documents arrive. Unrolled +
+  exponential growth gives amortised O(1) appends with very little pointer overhead per
+  posting.
+
+Conceptually the data structure is a per-field map `term_bytes → posting stream`, but the
+streams are append-only arena slabs, not `Vec<...>`s — that's why the writer's memory
+budget is one big arena rather than lots of small heap allocations.
+
+The accumulator runs until either:
+- The memory budget is exhausted (`mem_usage()` exceeds the `heap_size` passed to
+  `writer(...)`), in which case the `SegmentWriter` is finalized to disk and a fresh one
+  is started, or
 - `commit()` is called.
-
-At that point the Stacker is serialised to disk as a segment.
 
 Source: `stacker/`, `src/indexer/segment_writer.rs`.
 
 ### 10.2 Serialisation to segment files
 
-Serialisation happens in term-sorted order:
+Two phases — **incremental during `add_document`**, then a **finalize phase** when the
+segment is flushed.
 
-1. **Sort terms** — iterate the Stacker's hash map in sorted order (required for FST construction).
-2. **Build FST** — feed terms in order to an FST builder; each term is mapped to its ordinal.
-3. **Write posting list** — for each term, compress and write its DocId list (delta + bitpack) to `.idx`.
-4. **Write positions** — for fields with positions, delta-encode and write to `.pos`.
-5. **Write term info** — write `TermInfo` (doc_freq, byte ranges) to the SSTable in `.term`.
-6. **Write fast fields** — flush column-oriented numeric data to `.fast`.
-7. **Write field norms** — write one byte per (doc, field) to `.fieldnorm`.
-8. **Write docstore** — write compressed blocks of stored fields to `.store`.
-9. **Update meta.json** — atomically record the new segment in `meta.json`.
+**Per-document (incremental, in `SegmentWriter::add_document`,
+`src/indexer/segment_writer.rs:347–361`):**
+
+1. **Fast-field writer** receives the document's column values
+   (`fast_field_writers.add_document`).
+2. **Inverted-index writer** indexes each indexed field: tokens → terms → posting writer
+   (which buffers them in `stacker`'s hash map by `Term`).
+3. **Field-norm writer** records the token count per (doc, field).
+4. **Docstore writer** appends the doc to a 16 KB block; once the block is full it is
+   LZ4-compressed and flushed immediately (`store_writer.store(&doc, &schema)`). The
+   docstore is therefore *not* a final-phase write — it streams to disk during indexing.
+
+**Finalize (`remap_and_write`, `src/indexer/segment_writer.rs:389–419`):**
+
+5. **Field norms serialized** to `.fieldnorm` first — they are reopened immediately so
+   the postings serializer can read them while writing.
+6. **Posting serialization** (one pass over fields, term-sorted):
+   - For each field, drain the stacker's hash map in sorted byte order. Sort is
+     required because the FST builder is streaming and accepts only ascending keys.
+   - For each term, write its 128-doc bitpacked posting blocks to `.idx`, optionally
+     write delta-encoded positions to `.pos`, and append the `TermInfo` (doc_freq +
+     byte ranges) to the in-progress `TermInfoStore`.
+   - Insert the term into the FST builder (`MapBuilder::insert(term_bytes, term_ord)`)
+     — `.term` ends up containing the FST followed by the bitpacked `TermInfoStore`.
+7. **Fast fields serialized** to `.fast` (`fast_field_writers.serialize`).
+8. **`SegmentSerializer::close`** (`src/indexer/segment_serializer.rs:80–88`):
+   fast-field writer terminated, postings serializer closed, **docstore writer closed**
+   (final partial block flushed + skip index footer written).
+
+After all per-thread segments finish, the `IndexWriter`:
+
+9. **`meta.json` is rewritten atomically** (write to temp file + `rename(2)`), now
+   listing the new segment(s).
 
 Source: `src/indexer/segment_writer.rs`, `src/postings/serializer.rs`.
 
@@ -933,28 +994,54 @@ Source: `src/query/range_query/range_query.rs:16–30`, `src/query/range_query/r
 
 ### 12.2 Strategy 2: Fast field scan (lazy)
 
-For IP address fields (and extensible to others), tantivy uses a second strategy: scan the
-fast field column directly.
+When the field has `FAST` set, tantivy walks the column directly via `RangeDocSet`
+(`src/query/range_query/fast_field_range_doc_set.rs`):
 
-The `FastFieldRangeDocSet`:
-1. Opens the fast field column reader.
-2. Iterates DocIds from 0 to max_doc sequentially.
-3. For each DocId, fetches its value and checks whether it falls in the range.
-4. Emits matching DocIds lazily (one at a time without materialising a BitSet).
+1. Opens the fast-field column reader.
+2. Loads a batch of values starting at `next_fetch_start` (`DEFAULT_FETCH_HORIZON = 128`,
+   doubled adaptively up to a cap on full scans, kept small after big seeks).
+3. For each DocId in the batch, fetches its value and tests whether it falls in
+   `[lo, hi]`; matching DocIds are pushed into a small cursor.
+4. Emits matching DocIds lazily (one batch at a time, no upfront BitSet
+   materialization).
 
-This is lazy and memory-efficient. It is favoured when the fast field fits in cache or when
-the range is wide (many matching documents), because the column-oriented access pattern is
-cache-friendly.
+This is lazy and memory-efficient. It is favoured when the range is wide (many matching
+documents) or the field has high cardinality, because the column-oriented access pattern
+is cache-friendly and the work is `O(max_doc)` regardless of how many distinct values
+exist.
 
 Source: `src/query/range_query/fast_field_range_doc_set.rs`,
 `src/query/range_query/range_query_fastfield.rs`.
 
 ### 12.3 Choosing between strategies
 
-`RangeQuery::new()` inspects the field type. If the field is an IP address field, it uses
-Strategy 2. Otherwise it uses Strategy 1 (inverted index scan). In practice, for numeric
-fields that have both `INDEXED` and `FAST`, you can also manually construct a
-`FastFieldRangeDocSet` to get the lazy strategy.
+`RangeQuery::weight` (`src/query/range_query/range_query.rs:104–123`) inspects the field
+**at query time**:
+
+```rust
+if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
+    Box::new(FastFieldRangeWeight::new(...))      // Strategy 2
+} else {
+    Box::new(InvertedIndexRangeWeight::new(...))  // Strategy 1
+}
+```
+
+`is_type_valid_for_fastfield_range_query` (`src/query/range_query/mod.rs:13–26`) returns
+`true` for **every type except `Facet`** (Str, U64, I64, F64, Bool, Date, Json, IpAddr,
+Bytes). So the choice is essentially:
+
+| Field has `FAST`? | Strategy used |
+|-------------------|---------------|
+| Yes (and not a facet) | Strategy 2 — fast-field column scan |
+| No, but `INDEXED` set | Strategy 1 — term-dictionary byte-range scan |
+| `JSON` and not `FAST` | **Error** — `RangeQuery on JSON is only supported for fast fields currently` (line 113) |
+
+If you want the inverted-index path even on a `FAST`-able field (e.g. the range is very
+selective and you'd rather pay the term-dict cost than scan the column), build an
+`InvertedIndexRangeQuery` directly instead of `RangeQuery`.
+
+The IP-only carve-out that earlier docs and notes mention is historical — in current
+tantivy the fast-field path is the **default whenever `FAST` is available**.
 
 ### Questions
 
@@ -1011,48 +1098,89 @@ Query
 ### 13.1 Query
 
 A `Query` is a stateless, shareable description of what to match. It knows nothing about
-segments. Its only job is to produce a `Weight`.
+segments. Its only required job is to produce a `Weight`; everything else has a default
+implementation. From `src/query/query.rs:128–163`:
 
 ```rust
-pub trait Query: Debug + Any {
-    fn weight(&self, enable_scoring: EnableScoring<'_>) -> Result<Box<dyn Weight>>;
-    fn explain(&self, searcher: &Searcher, doc: DocAddress) -> Result<Explanation>;
-    fn count(&self, searcher: &Searcher) -> Result<usize>;
+pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
+    /// Required.
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
+
+    /// Default impl: builds a Weight, opens the doc's segment, calls weight.explain.
+    fn explain(&self, searcher: &Searcher, doc_address: DocAddress)
+        -> crate::Result<Explanation> { /* default */ }
+
+    /// Default impl: builds a Weight (scoring disabled), sums weight.count over segments.
+    fn count(&self, searcher: &Searcher) -> crate::Result<usize> { /* default */ }
+
+    /// Walk every term used by the query (for stats collection / weight construction).
+    fn query_terms<'a>(&'a self, _visitor: &mut dyn FnMut(&'a Term, bool)) {}
 }
 ```
+
+`EnableScoring` is an enum (`Enabled { searcher, statistics_provider }` or
+`Disabled { schema, searcher_opt }`) that lets `Query::weight` decide whether to wire up
+BM25 statistics. `count()` uses the `Disabled` form because pure matching doesn't need
+IDF — that's where the perf saving comes from.
 
 ### 13.2 Weight
 
 A `Weight` is created once per search. It has access to the `Searcher` and can pre-compute
-index-wide statistics (like IDF). It produces a `Scorer` for each segment.
+index-wide statistics (like IDF). It produces a `Scorer` for each segment. From
+`src/query/weight.rs:62–`:
 
 ```rust
-pub trait Weight: Send + Sync {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>>;
-    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation>;
+pub trait Weight: Send + Sync + 'static {
+    /// Required: scorer for one segment, with an optional boost factor.
+    fn scorer(&self, reader: &SegmentReader, boost: Score)
+        -> crate::Result<Box<dyn Scorer>>;
+
+    /// Required: per-doc explanation.
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;
+
+    /// Default impl: build a scorer at boost 1.0 and walk it, intersecting with the
+    /// alive bitset to skip deleted docs.
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> { /* default */ }
+
+    // plus internal `for_each`, `for_each_no_score`, `for_each_pruning` helpers used by
+    // the collector framework
 }
 ```
 
 ### 13.3 Scorer
 
-A `Scorer` is a `DocSet` — a lazy iterator over matched DocIds in the current segment.
-It also provides a `score()` method.
+A `Scorer` is a `DocSet` — a lazy iterator over matched DocIds in the current segment —
+plus a `score()` method. From `src/query/scorer.rs:11–16`:
 
 ```rust
-pub trait Scorer: DocSet {
+pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     fn score(&mut self) -> Score;
-}
-
-pub trait DocSet {
-    fn advance(&mut self) -> DocId;   // moves to next matching doc
-    fn doc(&self) -> DocId;            // current DocId
-    fn size_hint(&self) -> u32;
 }
 ```
 
-The `Searcher::search` method iterates over all segment readers, calls `weight.scorer(reader)` for each, then calls `advance()` repeatedly and passes each DocId to the Collector.
+`DocSet` itself (`src/docset.rs:26–`) is small but has more methods than the simplified
+version a tutorial usually shows:
 
-Source: `src/query/query.rs`, `src/query/weight.rs`, `src/query/scorer.rs`.
+```rust
+pub trait DocSet: Send {
+    fn advance(&mut self) -> DocId;     // returns the new current DocId
+    fn doc(&self) -> DocId;              // current DocId
+    fn size_hint(&self) -> u32;          // upper-bound estimate
+    fn seek(&mut self, target: DocId) -> DocId { /* default: advance until ≥ target */ }
+    // …plus `seek_danger`, `fill_buffer`, bitset helpers, etc.
+}
+```
+
+The terminator value is **`TERMINATED = i32::MAX as u32`** (`src/docset.rs:12`), not
+`u32::MAX` — that's a deliberate choice driven by SSE2 not having an unsigned `[u32; 4]`
+comparison.
+
+The `Searcher::search` method iterates over all segment readers, calls `weight.scorer(reader, boost)`
+for each, then drives `advance()`/`score()` and passes each (DocId, Score) to the
+Collector.
+
+Source: `src/query/query.rs`, `src/query/weight.rs`, `src/query/scorer.rs`,
+`src/docset.rs`.
 
 ### Questions
 
@@ -1120,18 +1248,28 @@ Run a query on a small index and observe the call pattern. Answer:
 
 | Topic | File |
 |-------|------|
-| Segment file extensions | `src/index/index_meta.rs:111–120` |
-| meta.json structure | `src/index/index_meta.rs` |
-| Term encoding (big-endian) | `src/schema/term.rs` |
-| FST term dictionary | `src/termdict/`, `sstable/` |
-| TermInfo structure | `src/postings/term_info.rs` |
-| Posting block size (128) | `src/postings/compression/mod.rs:3` |
-| BitPacker4x SIMD | `bitpacker/` |
+| Segment components (enum) | `src/index/segment_component.rs` |
+| Segment file extensions | `src/index/index_meta.rs:111–123` |
+| meta.json structure & `IndexSettings` | `src/index/index_meta.rs:214–242` |
+| Term encoding (big-endian) | `src/schema/term.rs:128–183`, `src/termdict/mod.rs:1–22` |
+| Numeric → u64 monotonic mapping | `columnar/src/column_values/monotonic_mapping.rs:115–187`, `common/src/lib.rs:69–104` |
+| Date precision (seconds at indexing time) | `src/schema/date_time_options.rs:9` |
+| FST term dictionary (default backend) | `src/termdict/fst_termdict/termdict.rs` |
+| `TermInfoStore` (block size 256) | `src/termdict/fst_termdict/term_info_store.rs:12, 96–158` |
+| `TermInfo` struct | `src/postings/term_info.rs:8–16` |
+| Posting block size (128 = `BitPacker4x::BLOCK_LEN`) | `src/postings/compression/mod.rs:3` |
+| BitPacker4x SIMD | external crate `bitpacking = 0.9.3` (see `Cargo.toml:42`) |
 | Skip list | `src/postings/skip.rs` |
-| Field norm table (256 values) | `src/fieldnorm/code.rs` |
-| BM25 formula (K1=1.2, B=0.75) | `src/query/bm25.rs:8–9, 52–66` |
-| Docstore block size (16 KB) | `src/store/mod.rs:76` |
-| Docstore cache (100 blocks) | `src/store/reader.rs:25` |
-| LogMergePolicy defaults | `src/indexer/log_merge_policy.rs:8–15` |
+| Field norm table (256 values) | `src/fieldnorm/code.rs:1–270` |
+| BM25 formula (K1=1.2, B=0.75) | `src/query/bm25.rs:8–9, 52–69, 179–193` |
+| Docstore default block size (16 384 B) | `src/index/index_meta.rs:230` |
+| Docstore default codec (LZ4) | `src/store/compressors.rs:133–143` |
+| Docstore cache capacity (100) | `src/store/reader.rs:25` |
+| `LogMergePolicy` defaults | `src/indexer/log_merge_policy.rs:8–11, 130–140` |
 | Range query strategies | `src/query/range_query/` |
-| Query/Weight/Scorer traits | `src/query/query.rs`, `weight.rs`, `scorer.rs` |
+| `RangeQuery::new` signature (`Bound<Term>`) | `src/query/range_query/range_query.rs:80` |
+| Query / Weight / Scorer traits | `src/query/query.rs`, `weight.rs`, `scorer.rs` |
+| Default analyser (lowercase + RemoveLongFilter(40)) | `src/tokenizer/tokenizer_manager.rs:53–81` |
+| `STRING` / `TEXT` text-options presets | `src/schema/text_options.rs:264–285` |
+| Writer lock filename `.tantivy-writer.lock` | `src/directory/directory_lock.rs:45–46` |
+| `delete_term` (no analyser, builds a `TermQuery`) | `src/indexer/index_writer.rs:680–686` |
